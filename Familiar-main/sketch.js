@@ -8,7 +8,7 @@ new p5(function(p) {
     // ============================================================
     //  MAZE CONFIG
     // ============================================================
-    let CELL = 52;
+    let CELL = 40;
     let COLS, ROWS;
     let maze = [];
 
@@ -29,7 +29,7 @@ new p5(function(p) {
     //  DOORS  (shared pool, 4 total)
     // ============================================================
     let doors = [];
-    const TOTAL_DOORS     = 4;
+    const TOTAL_DOORS     = 80;
     const DOOR_ANIM_SPEED = 0.045;
     const REROUTE_FRAMES  = 90;  // frames blocked before rerouting
 
@@ -86,8 +86,8 @@ new p5(function(p) {
 
         // Place doors — 2 per creature, on different paths where possible
         doors = [];
-        placeDoors(creatures[0], 2);
-        placeDoors(creatures[1], 2);
+        placeDoors(creatures[0], 5);
+        placeDoors(creatures[1], 8);
     }
 
     function path0StartX(paths) { return paths[0][0].col * CELL + CELL / 2; }
@@ -202,7 +202,7 @@ new p5(function(p) {
         for (let attempt = 0; attempt < 60 && placed < count; attempt++) {
             let pIdx = p.floor(p.random(creature.paths.length));
             let path = creature.paths[pIdx];
-            if (path.length < 4) continue;
+            if (path.length < 9) continue;
 
             let iMin = 2, iMax = path.length - 3;
             if (iMin >= iMax) continue;
