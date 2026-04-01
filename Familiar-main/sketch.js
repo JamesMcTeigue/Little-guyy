@@ -87,7 +87,7 @@ new p5(function(p) {
         // Place doors — 2 per creature, on different paths where possible
         doors = [];
         placeDoors(creatures[0], 5);
-        placeDoors(creatures[1], 8);
+        placeDoors(creatures[1], 5);
     }
 
     function path0StartX(paths) { return paths[0][0].col * CELL + CELL / 2; }
