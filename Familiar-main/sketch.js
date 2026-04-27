@@ -6,37 +6,60 @@
 new p5(function(p) {
 
     // ============================================================
-    //  CONFIG
+    //  CONFIG  ← tweak anything here, Buddy
     // ============================================================
-    let CELL = 40;
+
+    // ── Maze layout ──
+    let CELL    = 40;    // px per maze cell (bigger = fewer cells, larger corridors)
+    const HUD_H = 120;   // px reserved at top for HUD panels
+
+    // ── Creature physics ──
     let BLOB_DIST;
-    const NUM_BLOBS  = 28;   // more points = smoother liquid silhouette
-    const SPRING_K   = 0.18;
-    const DAMPING    = 0.68;
+    const NUM_BLOBS = 28;    // blob ring resolution — higher = smoother body
+    const SPRING_K  = 0.18;  // blob spring stiffness
+    const DAMPING   = 0.68;  // blob velocity damping
     function deriveSizes() { BLOB_DIST = CELL * 0.30; }
 
-    // Object count caps — performance
-    const MAX_GHOSTS   = 6;   // total across both mazes
-    const MAX_GEMS     = 10;  // total across both mazes
-    const MAX_SPIKES   = 8;   // total across both mazes
-    const MAX_DOORS    = 12;  // total across both mazes
-    const MAX_TRAIL    = 120; // points per trail (was 300)
+    // ── Gameplay numbers ──
+    const GHOSTS_PER_MAZE   = 4;    // ← how many ghosts spawn per maze
+    const GEMS_PER_MAZE     = 12;   // ← gems placed per maze
+    const SPIKES_PER_MAZE   = 5;    // ← spike traps placed per maze
+    const DOORS_PER_MAZE    = 8;    // ← doors placed per maze
+    const PATHS_PER_MAZE    = 8;    // ← BFS paths computed per creature
+    const TELEPORTERS_PER   = 5;    // ← teleporter hubs per creature
+    const DEATH_LIMIT       = 5;    // ← deaths before maze regenerates
+    const KILL_GHOST_COST   = 5;    // ← gems to kill nearest ghost
+    const MUTATE_MAZE_COST  = 5;    // ← gems to mutate maze section
+    const BONUS_GEMS        = 10;   // ← gem bonus when both reach end
+    const ALLY_COST          = 10;   // ← gems to summon a ghost-killing ally
+    const CREATURE_SPEED    = 0.13; // ← multiplier of CELL for creature speed
+    const EYE_RADIUS        = 0.38;  // ← eye size multiplier of BLOB_DIST (bigger = larger eyes)
+    const NARROW_CHANCE     = 0.018;  // ← fraction of passages that are narrow (0=none, 1=all)
 
-    const DOOR_ANIM_SPEED     = 0.045;
-    const REROUTE_FRAMES      = 180;
-    const PATH_SWITCH_INTERVAL = 1800; // 30 seconds at 60fps — auto switch path  // wait longer before rerouting
-    const TRAIL_MAX       = MAX_TRAIL;
-    const TRAIL_LIFE      = 80;   // fades in ~1.3 seconds
+    // ── Timing (frames at 60fps) ──
+    const REROUTE_FRAMES        = 180;  // frames blocked before rerouting
+    const PATH_SWITCH_INTERVAL  = 1800; // frames between auto-repath (30s)
+    const MAZE_SHIFT_INTERVAL   = 1800; // frames between automatic wall shifts (30s)
+    const RESET_DELAY           = 180;  // frames of celebration before new maze
 
+    // ── Performance caps ──
+    const MAX_GHOSTS = GHOSTS_PER_MAZE * 2;
+    const MAX_GEMS   = GEMS_PER_MAZE   * 2;
+    const MAX_SPIKES = SPIKES_PER_MAZE * 2;
+    const MAX_DOORS  = DOORS_PER_MAZE  * 2;
+    const MAX_TRAIL  = 120;  // trail points per creature
+    const TRAIL_MAX  = MAX_TRAIL;
+    const TRAIL_LIFE = 80;   // frames until trail fades
+    const DOOR_ANIM_SPEED = 0.045;
+
+    // ── Persistent state (never reset between mazes) ──
     let resetTimer    = -1;
-    const RESET_DELAY  = 180;
-    const DEATH_LIMIT  = 5;    // deaths before maze changes
-    // Persistent across maze resets (survive init())
-    let deathCounts  = [0, 0]; // deaths per creature index
-    let gemCounts    = [0, 0]; // gems collected per creature index
-    let mazeGeneration = 0;    // how many times maze has regenerated
-    const KILL_GHOST_COST  = 5;   // gems to kill nearest ghost
-    const MUTATE_MAZE_COST = 10;  // gems to mutate a section of maze
+    let deathCounts   = [0, 0];
+    let gemCounts     = [0, 0];
+    let mazeGeneration = 0;
+    let totalDeaths   = [0, 0];
+    let mazesWon      = [0, 0];
+    let mazesLost     = [0, 0];
 
     const PALETTES = [
         { body:[6,10,16],   glow:[10,220,90],  shimmer:[60,140,255], trail:[8,28,14],  trailGlow:[15,200,80]  },
@@ -54,7 +77,9 @@ new p5(function(p) {
     let teleporters = [];
     let creatures   = [];
     let ghosts      = [];
-    let gems        = [];   // collectables — creature picks these up for points
+    let gems        = [];
+    let particles   = [];  // pop bursts
+    let allies      = [];  // summoned ghost-killers   // collectables — creature picks these up for points
     let spikes      = [];   // traps — send creature back on touch, click to deactivate
     let _creatureId = 0;
 
@@ -71,6 +96,7 @@ new p5(function(p) {
         let sz = canvasSize();
         p.createCanvas(sz.w, sz.h).parent('canvas-container');
         deriveSizes();
+        loadStats();
         init();
     };
 
@@ -81,59 +107,67 @@ new p5(function(p) {
         creatures   = [];
         doors       = [];
         teleporters = [];
+        ghosts      = [];
+        gems        = [];
+        spikes      = [];
+        particles   = [];
+        allies      = [];
         resetTimer  = -1;
 
         let halfW = p.floor(p.width / 2);
         let gap   = 2; // px gap between the two mazes
 
-        // Build left maze — occupies pixels 0..halfW-gap
-        mazeL = buildMaze(halfW - gap, p.height, 0);
-        // Build right maze — occupies pixels halfW+gap..width
-        mazeR = buildMaze(p.width - halfW - gap, p.height, halfW + gap);
+        // Build left maze — starts below HUD
+        mazeL = buildMaze(halfW - gap, p.height, 0, HUD_H);
+        // Build right maze — starts below HUD
+        mazeR = buildMaze(p.width - halfW - gap, p.height, halfW + gap, HUD_H);
 
         // Creature 0: left maze, left→right
         let r0     = p.floor(mazeL.rows * 0.5);
-        let paths0 = findMultiplePaths(mazeL, 0, r0, mazeL.cols-1, r0, 8);
+        let paths0 = findMultiplePaths(mazeL, 0, r0, mazeL.cols-1, r0, PATHS_PER_MAZE);
         let c0 = createCreature(mazeL,
             paths0[0][0].col * CELL + CELL/2 + mazeL.offsetX,
-            paths0[0][0].row * CELL + CELL/2,
+            paths0[0][0].row * CELL + CELL/2 + mazeL.offsetY,
             paths0, PALETTES[0]
         );
+        c0.gemsCollected = gemCounts[0] || 0;  // restore gem total across resets
         creatures.push(c0);
 
         // Creature 1: right maze, right→left
         let r1     = p.floor(mazeR.rows * 0.5);
-        let paths1 = findMultiplePaths(mazeR, mazeR.cols-1, r1, 0, r1, 8);
+        let paths1 = findMultiplePaths(mazeR, mazeR.cols-1, r1, 0, r1, PATHS_PER_MAZE);
         let c1 = createCreature(mazeR,
             paths1[0][0].col * CELL + CELL/2 + mazeR.offsetX,
-            paths1[0][0].row * CELL + CELL/2,
+            paths1[0][0].row * CELL + CELL/2 + mazeR.offsetY,
             paths1, PALETTES[1]
         );
+        c1.gemsCollected = gemCounts[1] || 0;  // restore gem total across resets
         creatures.push(c1);
 
-        placeDoors(c0, 8);
-        placeDoors(c1, 8);
-        placeTeleporters(c0, 5);
-        placeTeleporters(c1, 5);
+        placeDoors(c0, DOORS_PER_MAZE);
+        placeDoors(c1, DOORS_PER_MAZE);
+        placeTeleporters(c0, TELEPORTERS_PER);
+        placeTeleporters(c1, TELEPORTERS_PER);
 
         // 4 ghosts per maze, spread across quadrants
         ghosts = [];
         gems   = [];
         spikes = [];
-        spawnGhosts(mazeL, 4);
-        spawnGhosts(mazeR, 4);
-        placeGems(mazeL, c0, 8);
-        placeGems(mazeR, c1, 8);
-        placeSpikes(mazeL, c0, 5);
-        placeSpikes(mazeR, c1, 5);
+        spawnGhosts(mazeL, GHOSTS_PER_MAZE);
+        spawnGhosts(mazeR, GHOSTS_PER_MAZE);
+        placeGems(mazeL, c0, GEMS_PER_MAZE);
+        placeGems(mazeR, c1, GEMS_PER_MAZE);
+        placeSpikes(mazeL, c0, SPIKES_PER_MAZE);
+        placeSpikes(mazeR, c1, SPIKES_PER_MAZE);
     }
 
     // ============================================================
     //  MAZE GENERATION
     // ============================================================
-    function buildMaze(pixelW, pixelH, offsetX) {
+    function buildMaze(pixelW, pixelH, offsetX, offsetY) {
+        offsetY = offsetY || 0;
         let cols = p.max(p.floor(pixelW / CELL), 5);
-        let rows = p.max(p.floor(pixelH / CELL), 5);
+        let rows = p.max(p.floor((pixelH - offsetY) / CELL), 5);
         let cells = [];
         for (let r = 0; r < rows; r++) {
             cells[r] = [];
@@ -161,7 +195,49 @@ new p5(function(p) {
             }
             if (!moved) stack.pop();
         }
-        return { cols, rows, cells, offsetX };
+        // ── Extra wall removals for multiple openings / loops ──
+        // Remove ~15% of remaining walls to create braided paths with multiple choices
+        let extraRemovals = Math.floor(cols * rows * 0.15);
+        let attempts = 0;
+        while (extraRemovals > 0 && attempts < 2000) {
+            attempts++;
+            let r = Math.floor(Math.random() * rows);
+            let c = Math.floor(Math.random() * cols);
+            let dirs2 = ['N','S','E','W'];
+            let d = dirs2[Math.floor(Math.random()*4)];
+            let nc=c, nr=r;
+            if (d==='N') nr--; if (d==='S') nr++;
+            if (d==='E') nc++; if (d==='W') nc--;
+            if (nr<0||nr>=rows||nc<0||nc>=cols) continue;
+            if (!cells[r][c].walls[d]) continue; // already open
+            // Don't remove border walls (keep maze bounded)
+            if (c===0&&d==='W'||c===cols-1&&d==='E') continue;
+            if (r===0&&d==='N'||r===rows-1&&d==='S') continue;
+            cells[r][c].walls[d]            = false;
+            cells[nr][nc].walls[opposite(d)] = false;
+            extraRemovals--;
+        }
+
+        // Mark some passages as narrow — blocks ghosts, slows creatures
+        for (let r = 0; r < rows; r++) {
+            for (let c = 0; c < cols; c++) {
+                for (let d of ['E','S']) {
+                    let nc=c, nr=r;
+                    if (d==='E') nc++; else nr++;
+                    if (nc>=cols||nr>=rows) continue;
+                    if (!cells[r][c].walls[d]) {
+                        let isNarrow = Math.random() < NARROW_CHANCE;
+                        cells[r][c]['narrow_'+d]                       = isNarrow;
+                        cells[nr][nc]['narrow_'+{E:'W',S:'N'}[d]]      = isNarrow;
+                        // Ghosts can't squeeze — mark as impassable for them
+                        cells[r][c]['ghostWall_'+d]                    = isNarrow;
+                        cells[nr][nc]['ghostWall_'+{E:'W',S:'N'}[d]]   = isNarrow;
+                    }
+                }
+            }
+        }
+        return { cols, rows, cells, offsetX, offsetY,
+                 shiftTimer: MAZE_SHIFT_INTERVAL + Math.floor(Math.random()*600) };
     }
 
     function opposite(d) { return {N:'S',S:'N',E:'W',W:'E'}[d]; }
@@ -243,13 +319,14 @@ new p5(function(p) {
     function doorMidpoint(door) {
         let dc=door.dir==='E'?1:door.dir==='W'?-1:0;
         let dr=door.dir==='S'?1:door.dir==='N'?-1:0;
+        let oy=door.mz.offsetY||0;
         return {
             x: door.col*CELL+CELL/2 + dc*CELL/2 + door.mz.offsetX,
-            y: door.row*CELL+CELL/2 + dr*CELL/2
+            y: door.row*CELL+CELL/2 + dr*CELL/2 + oy
         };
     }
 
-    // Only check doors that belong to THIS creature — prevents cross-creature blocking
+    // Only check doors in THIS creature's maze — survives regeneration
     function doorBlocksStep(path, fromIdx, creatureId) {
         if (fromIdx<=0||fromIdx>=path.length) return null;
         let a=path[fromIdx-1], b=path[fromIdx];
@@ -257,9 +334,12 @@ new p5(function(p) {
         if (Math.abs(dc)+Math.abs(dr)!==1) return null;
         let dir=dc===1?'E':dc===-1?'W':dr===1?'S':'N';
         let opp=opposite(dir);
+        // Find which maze this creature is in
+        let c = creatures.find(cr => cr.id === creatureId);
+        let cMz = c ? c.mz : null;
         for (let d of doors) {
             if (d.open) continue;
-            if (d.ownerId !== creatureId) continue;  // ← KEY FIX
+            if (cMz && d.mz !== cMz) continue;  // filter by maze ref
             if (d.col===a.col&&d.row===a.row&&d.dir===dir) return d;
             if (d.col===b.col&&d.row===b.row&&d.dir===opp) return d;
         }
@@ -268,6 +348,12 @@ new p5(function(p) {
 
     p.mousePressed = function() {
         let mx=p.mouseX, my=p.mouseY;
+        // Toggle stats popup via button — load data fresh only on open
+        if (statsBtn && mx>statsBtn.x && mx<statsBtn.x+statsBtn.w && my>statsBtn.y && my<statsBtn.y+statsBtn.h) {
+            if (!showPopup) openPopup(); else showPopup = false;
+            return;
+        }
+        if (showPopup) { showPopup=false; return; }
         // Left click — open doors OR activate inactive teleporter
         if (p.mouseButton === p.LEFT) {
             for (let door of doors) {
@@ -276,21 +362,14 @@ new p5(function(p) {
                 if (dx*dx+dy*dy < (CELL*1.2)*(CELL*1.2)) door.open=true;
             }
             tryActivateTeleporter(mx, my);
-            // HUD buttons — kill ghost (5 gems) and mutate maze (10 gems)
-            for (let i = 0; i < creatures.length; i++) {
-                let c      = creatures[i];
-                let isLeft = (i === 0);
-                let panelX = isLeft ? 10 : p.floor(p.width/2) + 10;
-                let panelW = p.floor(p.width/2) - 20;
-                let panelY = 10;
-                // Kill ghost button — right side of panel
-                let btn1X = panelX + panelW - 90, btn1Y = panelY + 4, btn1W = 80, btn1H = 16;
-                if (mx > btn1X && mx < btn1X+btn1W && my > btn1Y && my < btn1Y+btn1H)
+            // HUD buttons — use rects stored by drawHUD each frame
+            for (let c of creatures) {
+                if (c._btn1 && mx>c._btn1.x && mx<c._btn1.x+c._btn1.w && my>c._btn1.y && my<c._btn1.y+c._btn1.h)
                     killNearestGhost(c);
-                // Mutate maze button
-                let btn2X = panelX + panelW - 90, btn2Y = panelY + 23, btn2W = 80, btn2H = 16;
-                if (mx > btn2X && mx < btn2X+btn2W && my > btn2Y && my < btn2Y+btn2H)
+                if (c._btn2 && mx>c._btn2.x && mx<c._btn2.x+c._btn2.w && my>c._btn2.y && my<c._btn2.y+c._btn2.h)
                     mutateMaze(c);
+                if (c._btn3 && mx>c._btn3.x && mx<c._btn3.x+c._btn3.w && my>c._btn3.y && my<c._btn3.y+c._btn3.h)
+                    summonAlly(c);
             }
             // Click to disarm spikes
             for (let sp of spikes) {
@@ -313,13 +392,15 @@ new p5(function(p) {
     // Prevent context menu on right-click
     document.addEventListener("contextmenu", e => e.preventDefault());
 
-    // ── Kill nearest ghost (costs 5 gems) ──
+    // ── Kill nearest ghost (costs 5 gems) — removes ONE ghost from this maze ──
     function killNearestGhost(creature) {
         if (creature.gemsCollected < KILL_GHOST_COST) return;
-        // Find closest ghost in same maze
+        // Find ghosts in the SAME maze object reference
+        let mazeGhosts = ghosts.filter(g => g.mz === creature.mz);
+        if (mazeGhosts.length === 0) return; // no ghosts to kill
+        // Find the nearest one
         let best = null, bestD = Infinity;
-        for (let g of ghosts) {
-            if (g.mz !== creature.mz) continue;
+        for (let g of mazeGhosts) {
             let dx = g.x - creature.x, dy = g.y - creature.y;
             let d  = dx*dx + dy*dy;
             if (d < bestD) { bestD = d; best = g; }
@@ -328,10 +409,153 @@ new p5(function(p) {
         creature.gemsCollected -= KILL_GHOST_COST;
         let cIdx = creatures.indexOf(creature);
         if (cIdx >= 0) gemCounts[cIdx] = creature.gemsCollected;
-        // Remove ghost and spawn explosion particles
+        // Splice out exactly that one ghost
         let gi = ghosts.indexOf(best);
-        if (gi >= 0) ghosts.splice(gi, 1);
-        creature.killFlash = 25;
+        if (gi >= 0) {
+            spawnPop(best.x, best.y, 255, 120, 50, 22);
+            ghosts.splice(gi, 1);
+        }
+        creature.killFlash = 30;
+    }
+
+    // ── Summon ally ghost-killer (costs 10 gems) ──
+    function summonAlly(creature) {
+        if (creature.gemsCollected < ALLY_COST) return;
+        // Max 2 active allies per maze at once
+        let mzAllies = allies.filter(a => a.mz === creature.mz);
+        if (mzAllies.length >= 2) return;
+        creature.gemsCollected -= ALLY_COST;
+        let cIdx = creatures.indexOf(creature);
+        if (cIdx >= 0) gemCounts[cIdx] = creature.gemsCollected;
+        // Spawn near the creature's current position
+        let col = p.constrain(p.floor((creature.x - creature.mz.offsetX)/CELL), 0, creature.mz.cols-1);
+        let row = p.constrain(p.floor((creature.y - (creature.mz.offsetY||0))/CELL), 0, creature.mz.rows-1);
+        allies.push({
+            mz:    creature.mz,
+            x:     col*CELL+CELL/2+creature.mz.offsetX,
+            y:     row*CELL+CELL/2+(creature.mz.offsetY||0),
+            col, row,
+            targetCol: col, targetRow: row,
+            moving:  false,
+            dir:     null,
+            phase:   p.random(p.TWO_PI),
+            speed:   CELL * 0.14,
+            life:    600,   // despawns after 600 frames if no kill
+            ownerId: creature.id,
+        });
+        creature.killFlash = 20;
+    }
+
+    function updateAllies() {
+        for (let i = allies.length-1; i >= 0; i--) {
+            let a = allies[i];
+            a.phase += 0.07;
+            a.life--;
+            if (a.life <= 0) { allies.splice(i,1); continue; }
+
+            // Navigate toward nearest ghost in same maze
+            let target = null, bestD = Infinity;
+            for (let g of ghosts) {
+                if (g.mz !== a.mz) continue;
+                let dx=g.x-a.x, dy=g.y-a.y;
+                let d=dx*dx+dy*dy;
+                if (d < bestD) { bestD=d; target=g; }
+            }
+            if (!target) { allies.splice(i,1); continue; } // no ghosts left
+
+            // Move cell by cell
+            if (!a.moving) {
+                let d = pickGhostDir(a.mz, a.col, a.row, a.dir, target, {chaseProb:0.92});
+                if (!d) continue;
+                a.dir = d;
+                a.moving = true;
+                let nc=a.col, nr=a.row;
+                if (d==='N') nr--; if (d==='S') nr++;
+                if (d==='E') nc++; if (d==='W') nc--;
+                a.targetCol = p.constrain(nc, 0, a.mz.cols-1);
+                a.targetRow = p.constrain(nr, 0, a.mz.rows-1);
+            }
+
+            let tx=a.targetCol*CELL+CELL/2+a.mz.offsetX;
+            let ty=a.targetRow*CELL+CELL/2+(a.mz.offsetY||0);
+            let dx=tx-a.x, dy=ty-a.y, dist=Math.sqrt(dx*dx+dy*dy);
+            if (dist < a.speed+1) {
+                a.x=tx; a.y=ty; a.col=a.targetCol; a.row=a.targetRow; a.moving=false;
+            } else {
+                a.x+=(dx/dist)*a.speed; a.y+=(dy/dist)*a.speed;
+            }
+
+            // Kill ghost on contact
+            for (let gi=ghosts.length-1; gi>=0; gi--) {
+                let g=ghosts[gi];
+                if (g.mz!==a.mz) continue;
+                let ex=g.x-a.x, ey=g.y-a.y;
+                if (ex*ex+ey*ey < (CELL*0.9)*(CELL*0.9)) {
+                    spawnPop(g.x, g.y, 255, 220, 0, 28); // gold pop
+                    spawnPop(a.x, a.y, 255, 180, 0, 20);
+                    ghosts.splice(gi, 1);
+                    allies.splice(i, 1);
+                    break;
+                }
+            }
+        }
+    }
+
+    function drawAllies() {
+        for (let a of allies) {
+            let pulse = 0.5+0.5*Math.sin(a.phase);
+            let sz = CELL*0.46 + pulse*CELL*0.05;
+            let lifeFrac = a.life / 600;
+
+            p.push(); p.translate(a.x, a.y);
+
+            // Glow — gold
+            for (let ring=3; ring>=1; ring--) {
+                p.noStroke();
+                p.fill(255, 200+ring*10, 0, p.map(ring,1,3,25,5) * lifeFrac);
+                p.ellipse(0,0,sz*2+ring*8);
+            }
+
+            // Body — gold ghost shape matching enemy ghosts
+            p.noStroke(); p.fill(255, 200, 0, 210 * lifeFrac);
+            p.beginShape();
+            let steps=24;
+            for (let i=0; i<=steps; i++) {
+                let ang = p.PI + (i/steps)*p.PI;
+                p.curveVertex(Math.cos(ang)*sz*0.5, Math.sin(ang)*sz*0.5);
+            }
+            let bumps=3;
+            for (let i=0; i<=bumps*2; i++) {
+                let f=i/(bumps*2);
+                let bx=p.lerp(-sz*0.5, sz*0.5, f);
+                let by=(i%2===0) ? sz*0.45 : sz*0.22+Math.sin(a.phase*2)*sz*0.06;
+                p.curveVertex(bx, by);
+            }
+            p.endShape(p.CLOSE);
+
+            // Inner highlight
+            p.fill(255,240,120,80*lifeFrac); p.ellipse(-sz*0.1,-sz*0.15,sz*0.55,sz*0.4);
+
+            // Eyes — target-seeking pupils
+            let lookX=0, lookY=0;
+            let nearGhost = ghosts.find(g=>g.mz===a.mz);
+            if (nearGhost) {
+                let ang=Math.atan2(nearGhost.y-a.y, nearGhost.x-a.x);
+                lookX=Math.cos(ang)*3; lookY=Math.sin(ang)*3;
+            }
+            let er=sz*0.11;
+            for (let eo of [{x:-sz*0.18,y:-sz*0.05},{x:sz*0.18,y:-sz*0.05}]) {
+                p.fill(255,255,255,230*lifeFrac); p.ellipse(eo.x,eo.y,er*2,er*2.4);
+                p.fill(80,40,0,220*lifeFrac);     p.ellipse(eo.x+lookX*0.5,eo.y+lookY*0.5,er*1.1,er*1.3);
+            }
+
+            // Life bar above head
+            let barW=sz*1.1, barH=3;
+            p.noStroke(); p.fill(40,40,40,160); p.rect(-barW/2,-sz*0.85,barW,barH,2);
+            p.fill(255,200,0,200*lifeFrac); p.rect(-barW/2,-sz*0.85,barW*lifeFrac,barH,2);
+
+            p.pop();
+        }
     }
 
     // ── Mutate a section of the maze (costs 10 gems) ──
@@ -342,18 +566,20 @@ new p5(function(p) {
         let cIdx = creatures.indexOf(creature);
         if (cIdx >= 0) gemCounts[cIdx] = creature.gemsCollected;
 
-        let mz  = creature.mz;
-        // Pick a random 3×3 anchor (away from edges)
-        let ac  = p.floor(p.random(1, mz.cols - 3));
-        let ar  = p.floor(p.random(1, mz.rows - 3));
-        let w   = 3, h = 3;
+        let mz = creature.mz;
 
-        // Reset visited state for the region
+        // Centre mutation on creature's current cell
+        let creatureCol = p.constrain(p.floor((creature.x - mz.offsetX) / CELL), 1, mz.cols - 3);
+        let creatureRow = p.constrain(p.floor((creature.y - (mz.offsetY||0)) / CELL), 1, mz.rows - 3);
+        let ac = creatureCol, ar = creatureRow;
+        let w = 3, h = 3;
+
+        // Reset visited flags for the region only
         for (let r = ar; r < ar+h; r++)
             for (let c = ac; c < ac+w; c++)
                 mz.cells[r][c].visited = false;
 
-        // Re-carve using DFS within the region
+        // Re-carve within the 3x3 patch using iterative DFS
         let stack = [{c:ac, r:ar}];
         mz.cells[ar][ac].visited = true;
         while (stack.length > 0) {
@@ -364,10 +590,9 @@ new p5(function(p) {
                 let nc=c, nr=r;
                 if (d==='N') nr--; if (d==='S') nr++;
                 if (d==='E') nc++; if (d==='W') nc--;
-                // Stay within the mutation region
                 if (nr < ar || nr >= ar+h || nc < ac || nc >= ac+w) continue;
                 if (mz.cells[nr][nc].visited) continue;
-                mz.cells[r][c].walls[d]            = false;
+                mz.cells[r][c].walls[d]             = false;
                 mz.cells[nr][nc].walls[opposite(d)] = false;
                 mz.cells[nr][nc].visited = true;
                 stack.push({c:nc, r:nr});
@@ -376,16 +601,31 @@ new p5(function(p) {
             if (!moved) stack.pop();
         }
 
-        // Flash to show which region changed
+        // ── REPATH from SPAWN → GOAL so creature can walk a valid path after death ──
+        // Always repath from the fixed spawn so sendToStart + pathIndex=1 is consistent
+        let newPaths = findMultiplePaths(mz, creature.spawnCol, creature.spawnRow,
+                                          creature.goalCol,  creature.goalRow, PATHS_PER_MAZE);
+        if (newPaths && newPaths.length > 0 && newPaths[0].length > 1) {
+            creature.paths      = newPaths;
+            creature.pathSetIdx = 0;
+            // Find closest node to current position so creature doesn't teleport
+            creature.pathIndex  = closestPathStep(newPaths[0], creature.x, creature.y, mz.offsetX);
+            creature.trail      = [];
+        }
+
+        // Visual flash showing mutated region
         creature.mutateFlash  = 30;
-        creature.mutateRegion = {x: ac*CELL+mz.offsetX, y: ar*CELL, w: w*CELL, h: h*CELL};
+        creature.mutateRegion = {
+            x: ac*CELL + mz.offsetX,
+            y: ar*CELL + (mz.offsetY||0),
+            w: w*CELL, h: h*CELL
+        };
     }
 
     function sendToStart(c) {
-        let path = c.paths[c.pathSetIdx];
-        let start = path[0];
-        c.x = start.col*CELL+CELL/2+c.mz.offsetX;
-        c.y = start.row*CELL+CELL/2;
+        // Always use the fixed spawn point — not path[0] which changes after mutation
+        c.x = c.spawnX;
+        c.y = c.spawnY;
         for (let b of c.blobs) { b.x=c.x; b.y=c.y; b.vx=0; b.vy=0; }
         c.pathIndex     = 1;
         c.pathSetIdx    = 0;
@@ -401,10 +641,14 @@ new p5(function(p) {
         // Track death and sync to persistent array
         c.deathCount++;
         let cIdx = creatures.indexOf(c);
-        if (cIdx >= 0) deathCounts[cIdx] = c.deathCount;
+        if (cIdx >= 0) {
+            deathCounts[cIdx] = c.deathCount;
+            totalDeaths[cIdx]++;
+        }
 
         // Flash the screen for this creature's side
         c.deathFlash = 20; // frames of flash
+        saveStats();
 
         // If this creature has died enough times, regenerate its maze
         if (c.deathCount >= DEATH_LIMIT) {
@@ -437,53 +681,92 @@ new p5(function(p) {
     function regenerateSide(sideIdx) {
         let halfW = p.floor(p.width / 2);
         let gap   = 2;
+        mazesLost[sideIdx]++;
 
         if (sideIdx === 0) {
-            // Regenerate left maze + creature 0
-            mazeL = buildMaze(halfW - gap, p.height, 0);
-            doors       = doors.filter(d => d.mz !== mazeL);
-            teleporters = teleporters.filter(t => t.mz !== mazeL);
-            gems        = gems.filter(g => g.mz !== mazeL);
-            spikes      = spikes.filter(s => s.mz !== mazeL);
-            ghosts      = ghosts.filter(g => g.mz !== mazeL);
+            let oldMaze = mazeL;  // capture OLD ref BEFORE rebuilding
+            mazeL = buildMaze(halfW - gap, p.height, 0, HUD_H);
+            // Filter out objects belonging to the OLD maze
+            doors       = doors.filter(d => d.mz !== oldMaze);
+            teleporters = teleporters.filter(t => t.mz !== oldMaze);
+            gems        = gems.filter(g => g.mz !== oldMaze);
+            spikes      = spikes.filter(s => s.mz !== oldMaze);
+            ghosts      = ghosts.filter(g => g.mz !== oldMaze);
             let r0    = p.floor(mazeL.rows * 0.5);
-            let p0    = findMultiplePaths(mazeL, 0, r0, mazeL.cols-1, r0, 8);
+            let p0    = findMultiplePaths(mazeL, 0, r0, mazeL.cols-1, r0, PATHS_PER_MAZE);
             let prevGems = creatures[0] ? creatures[0].gemsCollected : 0;
-            let prevDeaths = creatures[0] ? creatures[0].deathCount : 0;
             let c0 = createCreature(mazeL,
                 p0[0][0].col*CELL+CELL/2+mazeL.offsetX,
-                p0[0][0].row*CELL+CELL/2, p0, PALETTES[0]);
-            c0.gemsCollected = prevGems;
-            c0.deathCount    = prevDeaths;
+                p0[0][0].row*CELL+CELL/2+mazeL.offsetY, p0, PALETTES[0]);
+            c0.gemsCollected = prevGems;  // gems roll over!
             creatures[0] = c0;
-            placeDoors(c0, 8);
-            placeTeleporters(c0, 5);
-            spawnGhosts(mazeL, 4);
-            placeGems(mazeL, c0, 8);
-            placeSpikes(mazeL, c0, 5);
+            placeDoors(c0, DOORS_PER_MAZE);
+            placeTeleporters(c0, TELEPORTERS_PER);
+            spawnGhosts(mazeL, GHOSTS_PER_MAZE);
+            placeGems(mazeL, c0, GEMS_PER_MAZE);
+            placeSpikes(mazeL, c0, SPIKES_PER_MAZE);
         } else {
-            // Regenerate right maze + creature 1
-            mazeR = buildMaze(p.width - halfW - gap, p.height, halfW + gap);
-            doors       = doors.filter(d => d.mz !== mazeR);
-            teleporters = teleporters.filter(t => t.mz !== mazeR);
-            gems        = gems.filter(g => g.mz !== mazeR);
-            spikes      = spikes.filter(s => s.mz !== mazeR);
-            ghosts      = ghosts.filter(g => g.mz !== mazeR);
+            let oldMaze = mazeR;
+            mazeR = buildMaze(p.width - halfW - gap, p.height, halfW + gap, HUD_H);
+            doors       = doors.filter(d => d.mz !== oldMaze);
+            teleporters = teleporters.filter(t => t.mz !== oldMaze);
+            gems        = gems.filter(g => g.mz !== oldMaze);
+            spikes      = spikes.filter(s => s.mz !== oldMaze);
+            ghosts      = ghosts.filter(g => g.mz !== oldMaze);
             let r1    = p.floor(mazeR.rows * 0.5);
-            let p1    = findMultiplePaths(mazeR, mazeR.cols-1, r1, 0, r1, 8);
+            let p1    = findMultiplePaths(mazeR, mazeR.cols-1, r1, 0, r1, PATHS_PER_MAZE);
             let prevGems = creatures[1] ? creatures[1].gemsCollected : 0;
-            let prevDeaths = creatures[1] ? creatures[1].deathCount : 0;
             let c1 = createCreature(mazeR,
                 p1[0][0].col*CELL+CELL/2+mazeR.offsetX,
-                p1[0][0].row*CELL+CELL/2, p1, PALETTES[1]);
-            c1.gemsCollected = prevGems;
-            c1.deathCount    = prevDeaths;
+                p1[0][0].row*CELL+CELL/2+mazeR.offsetY, p1, PALETTES[1]);
+            c1.gemsCollected = prevGems;  // gems roll over!
             creatures[1] = c1;
-            placeDoors(c1, 8);
-            placeTeleporters(c1, 5);
-            spawnGhosts(mazeR, 4);
-            placeGems(mazeR, c1, 8);
-            placeSpikes(mazeR, c1, 5);
+            placeDoors(c1, DOORS_PER_MAZE);
+            placeTeleporters(c1, TELEPORTERS_PER);
+            spawnGhosts(mazeR, GHOSTS_PER_MAZE);
+            placeGems(mazeR, c1, GEMS_PER_MAZE);
+            placeSpikes(mazeR, c1, SPIKES_PER_MAZE);
+        }
+    }
+
+    // ============================================================
+    //  PARTICLES  — pop bursts for ghost death + player death
+    // ============================================================
+    function spawnPop(x, y, r, g, b, count) {
+        for (let i = 0; i < count; i++) {
+            let angle  = p.random(p.TWO_PI);
+            let speed  = p.random(1.5, 5.5);
+            particles.push({
+                x, y,
+                vx: Math.cos(angle) * speed,
+                vy: Math.sin(angle) * speed,
+                r, g, b,
+                life: 1.0,
+                decay: p.random(0.03, 0.07),
+                sz: p.random(3, 10),
+            });
+        }
+    }
+
+    function updateParticles() {
+        for (let i = particles.length - 1; i >= 0; i--) {
+            let pt = particles[i];
+            pt.x   += pt.vx;
+            pt.y   += pt.vy;
+            pt.vx  *= 0.88;
+            pt.vy  *= 0.88;
+            pt.vy  += 0.12;  // slight gravity
+            pt.life -= pt.decay;
+            if (pt.life <= 0) particles.splice(i, 1);
+        }
+    }
+
+    function drawParticles() {
+        p.noStroke();
+        for (let pt of particles) {
+            let a = pt.life * 220;
+            p.fill(pt.r, pt.g, pt.b, a);
+            p.ellipse(pt.x, pt.y, pt.sz * pt.life, pt.sz * pt.life);
         }
     }
 
@@ -514,10 +797,11 @@ new p5(function(p) {
             col = p.constrain(col, 0, mz.cols-1);
             row = p.constrain(row, 0, mz.rows-1);
             // Each ghost has a slightly different speed and chase probability
+            let ghostDelay = i * 60 + p.floor(p.random(30));
             ghosts.push({
                 mz,
                 x: col*CELL + CELL/2 + mz.offsetX,
-                y: row*CELL + CELL/2,
+                y: row*CELL + CELL/2 + (mz.offsetY||0),
                 col, row,
                 dir: null,
                 targetCol: col, targetRow: row,
@@ -525,7 +809,8 @@ new p5(function(p) {
                 phase: p.random(p.TWO_PI),
                 speed:      CELL * p.random(0.07, 0.11),
                 chaseProb:  p.random(0.55, 0.88),
-                hue:        p.floor(p.random(4)),  // 0=red 1=orange 2=pink 3=blue
+                hue:        p.floor(p.random(4)),
+                spawnDelay: ghostDelay,  // stagger ghost activation  // 0=red 1=orange 2=pink 3=blue
             });
         }
     }
@@ -536,7 +821,8 @@ new p5(function(p) {
     function pickGhostDir(mz, col, row, lastDir, targetCreature, ghost) {
         let cell = mz.cells[row][col];
         let dirs = ['N','S','E','W'];
-        let open = dirs.filter(d => !cell.walls[d]);
+        // Ghosts can't pass narrow passages (ghostWall flag)
+        let open = dirs.filter(d => !cell.walls[d] && !cell['ghostWall_'+d]);
         if (open.length === 0) return null;
 
         // Avoid reversing unless stuck
@@ -547,7 +833,7 @@ new p5(function(p) {
         let chaseP = (ghost && ghost.chaseProb) ? ghost.chaseProb : GHOST_CHASE_PROB;
         if (targetCreature && p.random() < chaseP) {
             let cx = targetCreature.x - mz.offsetX;
-            let cy = targetCreature.y;
+            let cy = targetCreature.y - (mz.offsetY||0);
             let gcx = col*CELL + CELL/2;
             let gcy = row*CELL + CELL/2;
 
@@ -558,7 +844,7 @@ new p5(function(p) {
                 if (d==='E') nc++; if (d==='W') nc--;
                 let nx=nc*CELL+CELL/2, ny=nr*CELL+CELL/2;
                 let distBefore = Math.sqrt((gcx-cx)**2+(gcy-cy)**2);
-                let distAfter  = Math.sqrt((nx -cx)**2+(ny -cy)**2);
+                let distAfter  = Math.sqrt((nx-cx)**2+(ny-cy)**2);
                 return { d, score: distBefore - distAfter };
             });
             scored.sort((a,b) => b.score - a.score);
@@ -573,9 +859,10 @@ new p5(function(p) {
     function updateGhosts() {
         for (let g of ghosts) {
             g.phase += 0.06;
+            if (g.spawnDelay > 0) { g.spawnDelay--; continue; }  // not active yet
 
             // Find the creature in this maze
-            let target = creatures.find(c => c.mz === g.mz && !c.finished);
+            let target = creatures.find(c => c.mz === g.mz);
 
             if (!g.moving) {
                 // Pick next cell to walk into
@@ -594,7 +881,7 @@ new p5(function(p) {
 
             // Move toward target cell
             let tx = g.targetCol*CELL+CELL/2+g.mz.offsetX;
-            let ty = g.targetRow*CELL+CELL/2;
+            let ty = g.targetRow*CELL+CELL/2+(g.mz.offsetY||0);
             let dx = tx - g.x, dy = ty - g.y;
             let dist = Math.sqrt(dx*dx+dy*dy);
 
@@ -611,12 +898,13 @@ new p5(function(p) {
             if (target && !target.teleporting) {
                 let cdx = g.x - target.x, cdy = g.y - target.y;
                 if (cdx*cdx+cdy*cdy < GHOST_CATCH_DIST*GHOST_CATCH_DIST) {
+                    spawnPop(target.x, target.y, 80, 200, 255, 18);
                     sendToStart(target);
                     // Ghost bounces back to a random spot after catching
                     g.col = p.floor(p.random(1, g.mz.cols-1));
                     g.row = p.floor(p.random(1, g.mz.rows-1));
                     g.x   = g.col*CELL+CELL/2+g.mz.offsetX;
-                    g.y   = g.row*CELL+CELL/2;
+                    g.y   = g.row*CELL+CELL/2+(g.mz.offsetY||0);
                     g.moving = false;
                 }
             }
@@ -625,6 +913,7 @@ new p5(function(p) {
 
     function drawGhosts() {
         for (let g of ghosts) {
+            if (g.spawnDelay > 0) continue;  // not active yet — hidden
             let x=g.x, y=g.y;
             let pulse = 0.5+0.5*Math.sin(g.phase);
             let sz = CELL*0.52 + pulse*CELL*0.06;
@@ -670,10 +959,10 @@ new p5(function(p) {
             // Eyes — white with dark pupils
             let eyeOffsets = [{x:-sz*0.18, y:-sz*0.05},{x:sz*0.18, y:-sz*0.05}];
             // Pupils track toward creature direction
-            let target = creatures.find(c => c.mz === g.mz);
+            let eyeTarget = creatures.find(c => c.mz === g.mz);
             let lookX=0, lookY=0;
-            if (target) {
-                let ang = Math.atan2(target.y-y, target.x-x);
+            if (eyeTarget) {
+                let ang = Math.atan2(eyeTarget.y-y, eyeTarget.x-x);
                 lookX = Math.cos(ang)*3; lookY = Math.sin(ang)*3;
             }
             for (let eo of eyeOffsets) {
@@ -688,32 +977,59 @@ new p5(function(p) {
     // ============================================================
     //  GEMS  (collectables — creature auto-picks up when nearby)
     // ============================================================
+    // Returns true if (col,row) is too close to any already-placed object in occupied set
+    function tooClose(col, row, occupied, minDist) {
+        for (let [oc, or_] of occupied) {
+            if (Math.abs(col-oc) + Math.abs(row-or_) < minDist) return true;
+        }
+        return false;
+    }
+
     function placeGems(mz, creature, count) {
         count = Math.min(count, Math.max(0, MAX_GEMS - gems.length));
         if (count <= 0) return;
-        let placed = 0, used = new Set();
-        // Collect interior nodes only (skip first 2 and last 2 of each path)
-        let allNodes = [];
+
+        // Build occupied set from already-placed objects in this maze
+        let occupied = new Set();
+        for (let g of gems)   if (g.mz===mz)   occupied.add(`${g.col},${g.row}`);
+        for (let s of spikes) if (s.mz===mz)   occupied.add(`${s.col},${s.row}`);
+
+        // Collect ALL interior nodes across all paths, deduplicated
+        let nodeMap = new Map();
         for (let path of creature.paths) {
-            for (let i = 3; i < path.length - 3; i++) allNodes.push(path[i]);
+            let lo = Math.floor(path.length * 0.12);
+            let hi = path.length - 3;
+            for (let i = lo; i < hi; i++) {
+                let n = path[i], key = `${n.col},${n.row}`;
+                if (!nodeMap.has(key)) nodeMap.set(key, n);
+            }
         }
-        // Shuffle so gems spread across different paths
-        allNodes = p.shuffle(allNodes);
-        // Space them out — pick every Nth node to avoid clustering
-        let step = Math.max(1, Math.floor(allNodes.length / count));
-        for (let i = 0; i < allNodes.length && placed < count; i += step) {
-            let n = allNodes[i];
+        let allNodes = p.shuffle([...nodeMap.values()]);
+
+        // Enforce minimum spacing of 3 cells between gems
+        let MIN_DIST = 3;
+        let placed = 0;
+        let placedSet = [];  // [{col,row}]
+        for (let n of allNodes) {
+            if (placed >= count) break;
             let key = `${n.col},${n.row}`;
-            if (used.has(key)) continue;
-            used.add(key);
+            if (occupied.has(key)) continue;
+            // Check distance from all previously placed gems this session
+            let bad = placedSet.some(p2 =>
+                Math.abs(n.col-p2.col) + Math.abs(n.row-p2.row) < MIN_DIST
+            );
+            if (bad) continue;
+            occupied.add(key);
+            placedSet.push(n);
             gems.push({
                 mz, ownerId: creature.id,
                 col: n.col, row: n.row,
                 x: n.col*CELL+CELL/2+mz.offsetX,
-                y: n.row*CELL+CELL/2,
+                y: n.row*CELL+CELL/2+(mz.offsetY||0),
                 collected: false,
                 phase: p.random(p.TWO_PI),
                 type: p.floor(p.random(3)),
+                spawnDelay: placed * 30 + p.floor(p.random(20)),  // stagger appearance
             });
             placed++;
         }
@@ -722,9 +1038,10 @@ new p5(function(p) {
     function updateGems() {
         for (let gem of gems) {
             if (gem.collected) continue;
+            if (gem.spawnDelay > 0) { gem.spawnDelay--; continue; }  // not visible yet
             gem.phase += 0.05;
             // Check if creature picks it up
-            let c = creatures.find(cr => cr.id === gem.ownerId);
+            let c = creatures.find(cr => cr.mz === gem.mz);
             if (!c || c.finished) continue;
             let dx = c.x - gem.x, dy = c.y - gem.y;
             if (dx*dx+dy*dy < (CELL*0.55)*(CELL*0.55)) {
@@ -741,6 +1058,7 @@ new p5(function(p) {
     function drawGems() {
         for (let gem of gems) {
             if (gem.collected) continue;
+            if (gem.spawnDelay > 0) continue;  // not visible yet
             let pulse = 0.5+0.5*Math.sin(gem.phase);
             let sz    = CELL*0.22 + pulse*CELL*0.06;
             p.push();
@@ -792,51 +1110,61 @@ new p5(function(p) {
     function placeSpikes(mz, creature, count) {
         count = Math.min(count, Math.max(0, MAX_SPIKES - spikes.length));
         if (count <= 0) return;
-        let gemKeys = new Set(gems.filter(g=>g.mz===mz).map(g=>`${g.col},${g.row}`));
-        // Start/end cells of ALL paths — never put a spike here
+
+        // Build occupied set — gems already placed + teleporter exit cells
+        let occupied = new Set();
+        for (let g of gems)   if (g.mz===mz) occupied.add(`${g.col},${g.row}`);
+        // Also keep teleporter exit cells safe
+        for (let hub of teleporters) {
+            if (hub.mz!==mz) continue;
+            for (let ex of hub.exits) occupied.add(`${ex.col},${ex.row}`);
+            occupied.add(`${hub.entry.col},${hub.entry.row}`);
+        }
+
+        // Protect spawn area (first 35%) and finish area of every path
         let safeKeys = new Set();
         for (let path of creature.paths) {
-            // Protect the first 35% of every path — where creature spawns and early walk
             let safeLen = p.floor(path.length * 0.35);
             for (let i = 0; i < safeLen; i++) safeKeys.add(`${path[i].col},${path[i].row}`);
-            // Also protect the very last 2 nodes (finish area)
             for (let i = path.length-3; i < path.length; i++)
                 safeKeys.add(`${path[i].col},${path[i].row}`);
         }
 
-        // Collect eligible nodes: only from the middle 35%-90% of each path
-        let candidates = [];
+        // Collect candidates from middle 35–90% of each path, deduplicated
+        let nodeMap = new Map();
         for (let path of creature.paths) {
             let lo = p.floor(path.length * 0.35);
             let hi = p.floor(path.length * 0.90);
             for (let i = lo; i < hi; i++) {
-                let n = path[i];
-                let key = `${n.col},${n.row}`;
-                if (!safeKeys.has(key) && !gemKeys.has(key))
-                    candidates.push(n);
+                let n = path[i], key = `${n.col},${n.row}`;
+                if (!safeKeys.has(key) && !nodeMap.has(key)) nodeMap.set(key, n);
             }
         }
+        let candidates = p.shuffle([...nodeMap.values()]);
 
-        // Shuffle and use a stride to spread them evenly
-        candidates = p.shuffle(candidates);
-        let stride  = Math.max(1, Math.floor(candidates.length / count));
-        let used    = new Set();
-        let placed  = 0;
-
-        for (let i = 0; i < candidates.length && placed < count; i += stride) {
-            let n   = candidates[i];
+        // Enforce min spacing of 4 cells between spikes
+        const MIN_DIST = 4;
+        let placed = 0, placedSet = [];
+        for (let n of candidates) {
+            if (placed >= count) break;
             let key = `${n.col},${n.row}`;
-            if (used.has(key)) continue;
-            used.add(key);
+            if (occupied.has(key)) continue;
+            let bad = placedSet.some(p2 =>
+                Math.abs(n.col-p2.col) + Math.abs(n.row-p2.row) < MIN_DIST
+            );
+            if (bad) continue;
+            occupied.add(key);
+            placedSet.push(n);
             spikes.push({
                 mz, ownerId: creature.id,
                 col: n.col, row: n.row,
                 x: n.col*CELL+CELL/2+mz.offsetX,
-                y: n.row*CELL+CELL/2,
-                armed: true,
+                y: n.row*CELL+CELL/2+(mz.offsetY||0),
+                armed: false,  // start disarmed, arm after spawnDelay
                 resetTimer: 0,
                 hitCooldown: 0,
                 phase: p.random(p.TWO_PI),
+                spawnDelay: placed * 45 + p.floor(p.random(30)),  // stagger arming
             });
             placed++;
         }
@@ -845,6 +1173,8 @@ new p5(function(p) {
     function updateSpikes() {
         for (let sp of spikes) {
             sp.phase += 0.04;
+            // Countdown spawn delay before arming
+            if (sp.spawnDelay > 0) { sp.spawnDelay--; if (sp.spawnDelay===0) sp.armed=true; continue; }
             // Tick post-death invincibility so creature isn't killed again immediately
             if (sp.hitCooldown > 0) { sp.hitCooldown--; continue; }
             if (!sp.armed) {
@@ -855,11 +1185,12 @@ new p5(function(p) {
                 }
                 continue;
             }
-            // Check if creature walks into spike
-            let c = creatures.find(cr => cr.id === sp.ownerId);
-            if (!c || c.finished || c.teleporting) continue;
+            // Match creature by maze reference (survives regeneration)
+            let c = creatures.find(cr => cr.mz === sp.mz);
+            if (!c || c.finished || c.teleporting || c.postTeleportGrace > 0) continue;
             let dx = c.x - sp.x, dy = c.y - sp.y;
             if (dx*dx+dy*dy < (CELL*0.30)*(CELL*0.30)) {
+                spawnPop(c.x, c.y, 255, 80, 80, 16);
                 sendToStart(c);
                 sp.hitCooldown = 120; // 2 second grace before this spike can kill again
             }
@@ -963,6 +1294,9 @@ new p5(function(p) {
             let node = path[xi];
             let key  = `${node.col},${node.row}`;
             if (usedCells.has(key)) continue;
+            // Never place exit on a spike cell
+            let onSpike = spikes.some(s => s.mz===mz && s.col===node.col && s.row===node.row);
+            if (onSpike) continue;
             usedCells.add(key);
             exits.push({ col:node.col, row:node.row, pathIdx:pi });
         }
@@ -997,21 +1331,21 @@ new p5(function(p) {
     function checkTeleport(c) {
         if (c.teleporting || c.finished) return;
         let col = p.constrain(p.floor((c.x - c.mz.offsetX) / CELL), 0, c.mz.cols-1);
-        let row = p.constrain(p.floor(c.y / CELL), 0, c.mz.rows-1);
+        let row = p.constrain(p.floor((c.y - (c.mz.offsetY||0)) / CELL), 0, c.mz.rows-1);
 
         for (let hub of teleporters) {
-            if (hub.ownerId !== c.id) continue;
+            if (hub.mz !== c.mz) continue;  // match by maze reference
             if (col !== hub.entry.col || row !== hub.entry.row) continue;
 
             // Warp to whichever exit is currently active
             let exit    = hub.exits[hub.activeExitIdx];
             let destX   = exit.col * CELL + CELL/2 + c.mz.offsetX;
-            let destY   = exit.row * CELL + CELL/2;
+            let destY   = exit.row * CELL + CELL/2 + (c.mz.offsetY||0);
 
             c.teleporting      = true;
             c.teleportProgress = 0;
             c.teleportFrom     = { x: hub.entry.col*CELL+CELL/2+c.mz.offsetX,
-                                   y: hub.entry.row*CELL+CELL/2 };
+                                   y: hub.entry.row*CELL+CELL/2+(c.mz.offsetY||0) };
             c.teleportTo       = { x: destX, y: destY };
 
             // Switch creature to the path that this exit belongs to
@@ -1033,7 +1367,7 @@ new p5(function(p) {
             for (let ei = 0; ei < hub.exits.length; ei++) {
                 let exit = hub.exits[ei];
                 let px = exit.col*CELL+CELL/2+hub.mz.offsetX;
-                let py = exit.row*CELL+CELL/2;
+                let py = exit.row*CELL+CELL/2+(hub.mz.offsetY||0);
                 let hitR = (CELL*0.75)*(CELL*0.75);
                 if ((mx-px)**2+(my-py)**2 < hitR) {
                     // Jump active exit to this one
@@ -1049,18 +1383,27 @@ new p5(function(p) {
     //  CREATURE FACTORY
     // ============================================================
     function createCreature(mz, x, y, paths, palette) {
+        // Note: caller must set gemsCollected from gemCounts after creation
         let blobs=[];
         for (let i=0;i<NUM_BLOBS;i++) {
             let a=(i/NUM_BLOBS)*p.TWO_PI;
             blobs.push({x:x+Math.cos(a)*BLOB_DIST, y:y+Math.sin(a)*BLOB_DIST, vx:0, vy:0});
         }
-        let destPt=paths[0][paths[0].length-1];
+        let destPt  = paths[0][paths[0].length-1];
+        let startPt = paths[0][0];
         return {
             id:_creatureId++, mz, x, y, vx:0, vy:0,
+            // Fixed spawn and goal — never change even after mutation
+            spawnX:   startPt.col*CELL+CELL/2+mz.offsetX,
+            spawnY:   startPt.row*CELL+CELL/2+(mz.offsetY||0),
+            spawnCol: startPt.col,
+            spawnRow: startPt.row,
+            goalCol:  destPt.col,
+            goalRow:  destPt.row,
             paths, pathSetIdx:0, pathIndex:1,
             blobs, trail:[],
             eyeOpen:1, blinkTimer:p.random(60,200),
-            speed:CELL*0.13,
+            speed:CELL*CREATURE_SPEED,
             squishX:1, squishY:1,
             blocked:false, blockedFrames:0,
             corridorX1:0, corridorY1:0, corridorX2:p.width, corridorY2:p.height,
@@ -1069,6 +1412,8 @@ new p5(function(p) {
             finishX:destPt.col*CELL+CELL/2+mz.offsetX,
             finishY:destPt.row*CELL+CELL/2,
             teleporting:false, teleportProgress:0, teleportFrom:null, teleportTo:null,
+            postTeleportGrace: 0,  // frames of spike immunity after teleporting
+            squeezeScale: 1.0,  // 1=normal, <1=narrow passage slowdown
             pathSwitchTimer: PATH_SWITCH_INTERVAL + p.floor(p.random(300)),
             gemsCollected: 0,
             deathCount: 0,
@@ -1090,15 +1435,16 @@ new p5(function(p) {
     // ============================================================
     function getCorridorBounds(c) {
         let mz  = c.mz;
+        let oy  = mz.offsetY||0;
         let col = p.constrain(p.floor((c.x-mz.offsetX)/CELL), 0, mz.cols-1);
-        let row = p.constrain(p.floor(c.y/CELL), 0, mz.rows-1);
+        let row = p.constrain(p.floor((c.y-oy)/CELL), 0, mz.rows-1);
         let cell=mz.cells[row][col]; let mg=1;
-        let x1=col*CELL+mg+mz.offsetX, y1=row*CELL+mg;
-        let x2=(col+1)*CELL-mg+mz.offsetX, y2=(row+1)*CELL-mg;
+        let x1=col*CELL+mg+mz.offsetX, y1=row*CELL+mg+oy;
+        let x2=(col+1)*CELL-mg+mz.offsetX, y2=(row+1)*CELL-mg+oy;
         if (!cell.walls.E&&col+1<mz.cols) x2=(col+2)*CELL-mg+mz.offsetX;
         if (!cell.walls.W&&col-1>=0)       x1=(col-1)*CELL+mg+mz.offsetX;
-        if (!cell.walls.S&&row+1<mz.rows) y2=(row+2)*CELL-mg;
-        if (!cell.walls.N&&row-1>=0)       y1=(row-1)*CELL+mg;
+        if (!cell.walls.S&&row+1<mz.rows) y2=(row+2)*CELL-mg+oy;
+        if (!cell.walls.N&&row-1>=0)       y1=(row-1)*CELL+mg+oy;
         return {x1,y1,x2,y2};
     }
 
@@ -1106,10 +1452,12 @@ new p5(function(p) {
     //  DRAW LOOP
     // ============================================================
     p.draw = function() {
+        try {
         p.background(6,6,12);
 
         for (let door of doors)
             if (door.open&&door.openAmt<1) door.openAmt=Math.min(1,door.openAmt+DOOR_ANIM_SPEED);
+        shiftMazes();
         updateTeleporters();
 
         // Draw divider line
@@ -1134,16 +1482,42 @@ new p5(function(p) {
         for (let c of creatures) drawCreature(c);
         updateGhosts();
         drawGhosts();
+        updateAllies();
+        drawAllies();
+        updateParticles();
+        drawParticles();
         drawFinishOverlay();
         drawHUD();
+        drawStatsButton();
+        drawPastRunsPopup();
         drawMapChangeWarning();
         tickReset();
         tickMapChange();
+        } catch(e) {
+            p.background(0);
+            p.fill(255,80,80); p.noStroke();
+            p.textSize(14); p.textAlign(p.LEFT, p.TOP);
+            p.text('ERROR: ' + e.message, 10, 10);
+            p.text(e.stack ? e.stack.split('\n')[1] : '', 10, 30);
+            console.error('DRAW ERROR:', e);
+        }
     };
 
     // ============================================================
     //  MOVEMENT
     // ============================================================
+    // Returns speed/size scale for the passage between path[idx-1] and path[idx]
+    function getNarrowFactor(c, path, idx) {
+        if (idx <= 0 || idx >= path.length) return 1;
+        let a = path[idx-1], b = path[idx];
+        let dc = b.col-a.col, dr = b.row-a.row;
+        if (Math.abs(dc)+Math.abs(dr) !== 1) return 1;
+        let dir = dc===1?'E':dc===-1?'W':dr===1?'S':'N';
+        let cell = c.mz.cells[a.row] && c.mz.cells[a.row][a.col];
+        if (!cell) return 1;
+        return cell['narrow_'+dir] ? 0.45 : 1.0;  // narrow = 45% speed
+    }
+
     function moveCreature(c) {
         if (c.finished) {
             c.finishTimer++;
@@ -1171,16 +1545,25 @@ new p5(function(p) {
             return;
         }
 
-        // ── Timed path switch every 30 seconds ──
+        // ── Timed repath every 30 seconds — recompute from current position ──
         c.pathSwitchTimer--;
         if (c.pathSwitchTimer <= 0) {
-            // Pick a different path (cycle through them)
-            let nextPath = (c.pathSetIdx + 1) % c.paths.length;
-            c.pathSetIdx = nextPath;
-            // Snap pathIndex to closest node on new path from current position
-            c.pathIndex  = closestPathStep(c.paths[nextPath], c.x, c.y, c.mz.offsetX);
+            let mz2    = c.mz;
+            let curCol = p.constrain(p.floor((c.x - mz2.offsetX) / CELL), 0, mz2.cols-1);
+            let curRow = p.constrain(p.floor((c.y - (mz2.offsetY||0)) / CELL), 0, mz2.rows-1);
+            let oldGoal2 = c.paths[0][c.paths[0].length-1];
+            let newPaths2 = findMultiplePaths(mz2, curCol, curRow, oldGoal2.col, oldGoal2.row, 8);
+            if (newPaths2 && newPaths2.length > 0 && newPaths2[0].length > 1) {
+                c.paths      = newPaths2;
+                c.pathSetIdx = 0;
+                c.pathIndex  = 1;
+                c.trail      = [];
+            } else {
+                // Fallback: just cycle existing paths
+                c.pathSetIdx = (c.pathSetIdx + 1) % c.paths.length;
+                c.pathIndex  = closestPathStep(c.paths[c.pathSetIdx], c.x, c.y, c.mz.offsetX);
+            }
             c.pathSwitchTimer = PATH_SWITCH_INTERVAL;
-            c.trail = []; // clear trail on repath so player can see the new route
         }
 
         let path=c.paths[c.pathSetIdx];
@@ -1206,7 +1589,7 @@ new p5(function(p) {
         if (c.teleporting) return;
 
         let target=path[idx];
-        let tx=target.col*CELL+CELL/2+c.mz.offsetX, ty=target.row*CELL+CELL/2;
+        let tx=target.col*CELL+CELL/2+c.mz.offsetX, ty=target.row*CELL+CELL/2+(c.mz.offsetY||0);
         let dx=tx-c.x, dy=ty-c.y;
         let dist=Math.sqrt(dx*dx+dy*dy);
 
@@ -1215,10 +1598,12 @@ new p5(function(p) {
             if (c.pathIndex>=path.length) {
                 let end=path[path.length-1];
                 c.finishX=end.col*CELL+CELL/2+c.mz.offsetX;
-                c.finishY=end.row*CELL+CELL/2;
+                c.finishY=end.row*CELL+CELL/2+(c.mz.offsetY||0);
                 c.pathIndex=path.length-1;
                 c.finished=true; c.finishTimer=0;
                 c.vx=0; c.vy=0;
+                let cIdx2 = creatures.indexOf(c);
+                if (cIdx2 >= 0) { mazesWon[cIdx2]++; saveStats(); }
                 checkAllFinished();
             }
         } else {
@@ -1259,7 +1644,17 @@ new p5(function(p) {
     }
 
     function checkAllFinished() {
-        if (creatures.every(c=>c.finished)) resetTimer=RESET_DELAY;
+        if (creatures.every(c=>c.finished)) {
+            resetTimer = RESET_DELAY;
+            // 10 gem bonus for completing together!
+            for (let c of creatures) {
+                c.gemsCollected += BONUS_GEMS;
+                c.gemFlash = 40;
+            }
+            gemCounts[0] = creatures[0].gemsCollected;
+            gemCounts[1] = creatures[1].gemsCollected;
+            saveStats();
+        }
     }
     function tickReset() {
         if (resetTimer<0) return;
@@ -1325,7 +1720,8 @@ new p5(function(p) {
                            Math.sin(angle)*2.4+t*0.008);
             // n1 gives big slow waves, n2 gives small fast ripples
             let noiseR = n1*0.7 + n2*0.3;
-            let r=BLOB_DIST*(0.55 + noiseR*1.0)*scaleFactor;  // wide range: 0.55x to 1.55x
+            let sqzScale = c.squeezeScale || 1;
+            let r=BLOB_DIST*(0.55 + noiseR*1.0)*scaleFactor*sqzScale;  // squeeze in narrow passages
             let tx=c.x+sx+Math.cos(angle)*r*c.squishX;
             let ty=c.y+sy+Math.sin(angle)*r*c.squishY;
             b.vx+=(tx-b.x)*SPRING_K; b.vy+=(ty-b.y)*SPRING_K;
@@ -1343,10 +1739,11 @@ new p5(function(p) {
         }
         c.squishX=p.lerp(c.squishX,1,0.09);
         c.squishY=p.lerp(c.squishY,1,0.09);
-        if (c.deathFlash   > 0) c.deathFlash--;
-        if (c.gemFlash     > 0) c.gemFlash--;
-        if (c.killFlash    > 0) c.killFlash--;
-        if (c.mutateFlash  > 0) c.mutateFlash--;
+        if (c.deathFlash        > 0) c.deathFlash--;
+        if (c.gemFlash          > 0) c.gemFlash--;
+        if (c.killFlash         > 0) c.killFlash--;
+        if (c.mutateFlash       > 0) c.mutateFlash--;
+        if (c.postTeleportGrace > 0) c.postTeleportGrace--;
     }
 
     // ============================================================
@@ -1474,29 +1871,51 @@ new p5(function(p) {
     }
 
     function drawEyes(c) {
-        let r=BLOB_DIST*0.28;
-        // Eyes shift slightly in travel direction
-        let tAngle=Math.atan2(c.vy,c.vx+0.001);
-        let lookX=Math.cos(tAngle)*1.8, lookY=Math.sin(tAngle)*1.8;
-        // Single large central eye when blocked (alarm), two small eyes normally
-        if (c.blocked) {
+        let r = BLOB_DIST * EYE_RADIUS;
+        let lookX, lookY;
+
+        // When finished, eyes look toward the OTHER creature
+        if (c.finished) {
+            let other = creatures.find(o => o !== c);
+            if (other) {
+                let ang = Math.atan2(other.y - c.y, other.x - c.x);
+                lookX = Math.cos(ang) * 2.2;
+                lookY = Math.sin(ang) * 2.2;
+            } else {
+                lookX = 0; lookY = 0;
+            }
+        } else if (c.blocked) {
+            // Panicked single eye — no look offset
+            lookX = 0; lookY = 0;
+        } else {
+            let tAngle = Math.atan2(c.vy, c.vx + 0.001);
+            lookX = Math.cos(tAngle) * 1.8;
+            lookY = Math.sin(tAngle) * 1.8;
+        }
+
+        if (c.blocked && !c.finished) {
             // One wide panicked eye
-            p.noStroke(); p.fill(255,80,80);
-            p.ellipse(c.x+lookX, c.y+lookY, r*2.2, r*1.4*c.eyeOpen);
-            if (c.eyeOpen>0.2) {
-                p.fill(5,5,10); p.ellipse(c.x+lookX,c.y+lookY, r*1.1, r*1.1*c.eyeOpen);
+            p.noStroke(); p.fill(255, 80, 80);
+            p.ellipse(c.x + lookX, c.y + lookY, r*2.2, r*1.4*c.eyeOpen);
+            if (c.eyeOpen > 0.2) {
+                p.fill(5, 5, 10);
+                p.ellipse(c.x + lookX, c.y + lookY, r*1.1, r*1.1*c.eyeOpen);
             }
         } else {
-            let offsets=[{x:-BLOB_DIST*0.28,y:-BLOB_DIST*0.18},{x:BLOB_DIST*0.28,y:-BLOB_DIST*0.22}];
+            // Two normal eyes — heart-shaped pupils when finished
+            let offsets = [{x:-BLOB_DIST*0.28, y:-BLOB_DIST*0.18}, {x:BLOB_DIST*0.28, y:-BLOB_DIST*0.22}];
             for (let eo of offsets) {
-                let ex=c.x+eo.x+lookX, ey=c.y+eo.y+lookY;
-                p.noStroke(); p.fill(230,245,230);
-                p.ellipse(ex,ey,r*2,r*2*c.eyeOpen);
-                if (c.eyeOpen>0.2) {
-                    p.fill(5,5,10);
-                    p.ellipse(ex+lookX*0.4,ey+lookY*0.4,r*1.05,r*1.05*c.eyeOpen);
-                    p.fill(255,255,255,220);
-                    p.ellipse(ex-r*0.28,ey-r*0.28,r*0.38,r*0.38);
+                let ex = c.x + eo.x + lookX;
+                let ey = c.y + eo.y + lookY;
+                p.noStroke();
+                // White of eye — slightly warm pink when finished
+                if (c.finished) p.fill(255, 220, 220); else p.fill(230, 245, 230);
+                p.ellipse(ex, ey, r*2, r*2*c.eyeOpen);
+                if (c.eyeOpen > 0.2) {
+                    p.fill(5, 5, 10);
+                    p.ellipse(ex + lookX*0.4, ey + lookY*0.4, r*1.05, r*1.05*c.eyeOpen);
+                    p.fill(255, 255, 255, 220);
+                    p.ellipse(ex - r*0.28, ey - r*0.28, r*0.38, r*0.38);
                 }
             }
         }
@@ -1506,8 +1925,10 @@ new p5(function(p) {
     //  MAZE DRAWING
     // ============================================================
     function drawMaze(mz) {
+        if (!mz) return;
         p.push();
         let ox=mz.offsetX;
+        let mazeOY=mz.offsetY||0;  // declared first — used throughout
 
         // Faint path highlights
         for (let c of creatures) {
@@ -1518,7 +1939,7 @@ new p5(function(p) {
                 p.strokeWeight(isCurrent?CELL*0.48:CELL*0.18);
                 p.stroke(c.palette.glow[0],c.palette.glow[1],c.palette.glow[2],isCurrent?28:8);
                 p.beginShape();
-                for (let pt of path) p.vertex(pt.col*CELL+CELL/2+ox, pt.row*CELL+CELL/2);
+                for (let pt of path) p.vertex(pt.col*CELL+CELL/2+ox, pt.row*CELL+CELL/2+mazeOY);
                 p.endShape();
             }
         }
@@ -1527,24 +1948,79 @@ new p5(function(p) {
         p.stroke(30,180,80,90); p.strokeWeight(1.5);
         for (let r=0;r<mz.rows;r++) {
             for (let c=0;c<mz.cols;c++) {
-                let cell=mz.cells[r][c], x=c*CELL+ox, y=r*CELL;
+                let cell=mz.cells[r][c], x=c*CELL+ox, y=r*CELL+mazeOY;
                 if (cell.walls.N) p.line(x,y,x+CELL,y);
                 if (cell.walls.S) p.line(x,y+CELL,x+CELL,y+CELL);
                 if (cell.walls.W) p.line(x,y,x,y+CELL);
                 if (cell.walls.E) p.line(x+CELL,y,x+CELL,y+CELL);
+                // ── Narrow passages — prominent squeeze gates ──
+                let gap = CELL * 0.32;
+                let off = (CELL - gap) / 2;
+                let pulse = 0.55 + 0.45 * Math.sin(p.frameCount * 0.05 + c * 0.7 + r * 1.1);
+
+                if (!cell.walls.E && cell['narrow_E']) {
+                    // Thick wall stubs — same colour as walls but heavier
+                    p.stroke(30, 200, 100, 180); p.strokeWeight(4);
+                    p.line(x+CELL, y,        x+CELL, y+off);        // top stub
+                    p.line(x+CELL, y+off+gap, x+CELL, y+CELL);     // bottom stub
+
+                    // Filled squeeze gate rectangle — bright teal block
+                    p.noStroke();
+                    p.fill(0, 220, 180, 55 + 35*pulse);
+                    p.rect(x+CELL-3, y+off, 6, gap);
+
+                    // Centre line highlight
+                    p.stroke(80, 255, 220, 180 + 60*pulse); p.strokeWeight(2);
+                    p.line(x+CELL, y+off, x+CELL, y+off+gap);
+
+                    // Small arrow chevron pointing right
+                    p.stroke(100, 255, 200, 160 + 80*pulse); p.strokeWeight(1.5);
+                    let mx2 = x+CELL, my2 = y+CELL/2, as2 = gap*0.22;
+                    p.line(mx2-as2, my2-as2, mx2, my2);
+                    p.line(mx2, my2, mx2-as2, my2+as2);
+
+                    p.stroke(30,180,80,90); p.strokeWeight(1.5); // restore
+                }
+
+                if (!cell.walls.S && cell['narrow_S']) {
+                    // Thick wall stubs
+                    p.stroke(30, 200, 100, 180); p.strokeWeight(4);
+                    p.line(x,        y+CELL, x+off,      y+CELL);  // left stub
+                    p.line(x+off+gap, y+CELL, x+CELL,    y+CELL);  // right stub
+
+                    // Filled squeeze gate
+                    p.noStroke();
+                    p.fill(0, 220, 180, 55 + 35*pulse);
+                    p.rect(x+off, y+CELL-3, gap, 6);
+
+                    // Centre line highlight
+                    p.stroke(80, 255, 220, 180 + 60*pulse); p.strokeWeight(2);
+                    p.line(x+off, y+CELL, x+off+gap, y+CELL);
+
+                    // Small arrow chevron pointing down
+                    p.stroke(100, 255, 200, 160 + 80*pulse); p.strokeWeight(1.5);
+                    let mx3 = x+CELL/2, my3 = y+CELL, as3 = gap*0.22;
+                    p.line(mx3-as3, my3-as3, mx3, my3);
+                    p.line(mx3, my3, mx3+as3, my3-as3);
+
+                    p.stroke(30,180,80,90); p.strokeWeight(1.5); // restore
+                }
             }
         }
 
         // Corner dots
         p.fill(30,180,80,45); p.noStroke();
-        for (let r=0;r<=mz.rows;r++) for (let c=0;c<=mz.cols;c++) p.ellipse(c*CELL+ox,r*CELL,2.5);
+        for (let r=0;r<=mz.rows;r++) for (let c=0;c<=mz.cols;c++) p.ellipse(c*CELL+ox,r*CELL+mazeOY,2.5);
+
+        // Shift flash
+        drawShiftFlash(mz);
 
         // Goal markers
         for (let c of creatures) {
             if (c.mz!==mz) continue;
             let path=c.paths[c.pathSetIdx];
             let goal=path[path.length-1]; if (!goal) continue;
-            let gx=goal.col*CELL+CELL/2+ox, gy=goal.row*CELL+CELL/2;
+            let gx=goal.col*CELL+CELL/2+ox, gy=goal.row*CELL+CELL/2+mazeOY;
             let pulse=0.5+0.5*p.sin(p.frameCount*0.05);
             p.noFill();
             p.stroke(c.palette.glow[0],c.palette.glow[1],c.palette.glow[2],180*pulse);
@@ -1593,7 +2069,7 @@ new p5(function(p) {
         for (let hub of teleporters) {
             let ox  = hub.mz.offsetX;
             let hx  = hub.entry.col*CELL+CELL/2+ox;
-            let hy  = hub.entry.row*CELL+CELL/2;
+            let hy  = hub.entry.row*CELL+CELL/2+(hub.mz.offsetY||0);
             let timeFrac = 1 - hub.timer / TP_EXIT_CYCLE;  // 0→1 countdown to next rotation
 
             // Draw entry hub — always active/bright
@@ -1703,108 +2179,133 @@ new p5(function(p) {
     }
 
     // ============================================================
-    //  HUD  — gem counters, death counters, buttons, effects
+    //  HUD  — separate panels per side, full stats, big buttons
     // ============================================================
     function drawHUD() {
         p.push();
         p.textFont('monospace');
 
+        let hw = p.floor(p.width / 2);
+
         for (let i = 0; i < creatures.length; i++) {
             let c      = creatures[i];
             let pal    = c.palette;
             let isLeft = (i === 0);
-            let panelX = isLeft ? 10 : p.floor(p.width/2) + 10;
-            let panelW = p.floor(p.width/2) - 20;
-            let panelY = 10;
-            let halfX  = isLeft ? 0 : p.floor(p.width/2);
+            let halfX  = isLeft ? 0 : hw;
 
-            // ── Full-screen flash effects ──
+            // ── Full-screen flash effects (drawn under HUD) ──
             if (c.deathFlash > 0) {
                 p.noStroke();
-                p.fill(200, 30, 30, p.map(c.deathFlash, 0, 20, 0, 100));
-                p.rect(halfX, 0, p.floor(p.width/2), p.height);
+                p.fill(200, 30, 30, p.map(c.deathFlash, 0, 20, 0, 90));
+                p.rect(halfX, 0, hw, p.height);
             }
             if (c.gemFlash > 0) {
                 p.noStroke();
-                p.fill(80, 220, 255, p.map(c.gemFlash, 0, 15, 0, 55));
-                p.rect(halfX, 0, p.floor(p.width/2), p.height);
+                p.fill(80, 220, 255, p.map(c.gemFlash, 0, 15, 0, 45));
+                p.rect(halfX, 0, hw, p.height);
             }
             if (c.killFlash > 0) {
                 p.noStroke();
-                p.fill(255, 180, 0, p.map(c.killFlash, 0, 25, 0, 70));
-                p.rect(halfX, 0, p.floor(p.width/2), p.height);
+                p.fill(255, 200, 0, p.map(c.killFlash, 0, 30, 0, 60));
+                p.rect(halfX, 0, hw, p.height);
             }
-
-            // ── Mutate flash — highlight the changed region ──
             if (c.mutateFlash > 0 && c.mutateRegion) {
                 let mr = c.mutateRegion;
-                let a  = p.map(c.mutateFlash, 0, 30, 0, 160);
-                p.noStroke(); p.fill(100, 200, 255, a*0.3);
+                let a  = p.map(c.mutateFlash, 0, 30, 0, 140);
+                p.noStroke(); p.fill(100, 200, 255, a * 0.3);
                 p.rect(mr.x, mr.y, mr.w, mr.h);
                 p.noFill(); p.stroke(100, 200, 255, a);
                 p.strokeWeight(2); p.rect(mr.x, mr.y, mr.w, mr.h);
             }
 
-            // ── HUD panel background ──
+            // ── Panel layout ──
+            let panelX = halfX + 8;
+            let panelY = 8;
+            let panelW = hw - 16;
+            let panelH = HUD_H - 16;  // always fits inside the reserved HUD band
+
+            // Panel background — solid dark with colour border
             p.noStroke();
-            p.fill(6, 6, 12, 175);
-            p.rect(panelX, panelY, panelW, 46, 4);
-            // Colour stripe
-            p.fill(pal.glow[0], pal.glow[1], pal.glow[2], 80);
-            p.rect(panelX, panelY, 4, 46, 4, 0, 0, 4);
+            p.fill(8, 10, 18, 220);
+            p.rect(panelX, panelY, panelW, panelH, 6);
+            // Coloured top border
+            p.fill(pal.glow[0], pal.glow[1], pal.glow[2], 160);
+            p.rect(panelX, panelY, panelW, 3, 6, 6, 0, 0);
+            // Coloured left strip
+            p.rect(panelX, panelY, 4, panelH, 6, 0, 0, 6);
 
-            // ── Gem count ──
-            p.fill(80, 220, 255, 220);
-            p.textSize(11); p.textAlign(p.LEFT, p.CENTER);
-            p.text('◆ ' + c.gemsCollected, panelX + 12, panelY + 12);
+            // ── Stats column (left side of panel) ──
+            let sx = panelX + 12;
+            p.textSize(12); p.textAlign(p.LEFT, p.TOP);
 
-            // ── Death count ──
-            p.fill(220, 100, 100, 200);
+            // Gems
+            p.fill(80, 220, 255, 255);
+            p.text('◆ GEMS: ' + c.gemsCollected, sx, panelY + 10);
+
+            // Current maze deaths vs limit
+            let deathColor = c.deathCount >= DEATH_LIMIT - 1 ? [255,80,80] : [220,130,130];
+            p.fill(deathColor[0], deathColor[1], deathColor[2], 240);
+            p.text('💀 MAZE: ' + c.deathCount + '/' + DEATH_LIMIT, sx, panelY + 27);
+
+            // Total deaths (lifetime)
+            p.fill(160, 100, 100, 200);
             p.textSize(10);
-            p.text('deaths: ' + c.deathCount + '/' + DEATH_LIMIT, panelX + 12, panelY + 32);
+            p.text('total deaths: ' + totalDeaths[i], sx, panelY + 43);
 
-            // ── Kill Ghost button (5 gems) ──
-            let btn1X = panelX + panelW - 92;
-            let btn1Y = panelY + 4;
-            let btn1W = 82, btn1H = 17;
-            let canKill = c.gemsCollected >= KILL_GHOST_COST;
-            p.noStroke();
-            p.fill(canKill ? [180,40,40] : [60,30,30], canKill ? 220 : 100);
-            // Draw button bg
-            if (canKill) p.fill(160, 35, 35, 220); else p.fill(50, 25, 25, 120);
-            p.rect(btn1X, btn1Y, btn1W, btn1H, 3);
-            // Button border
-            p.noFill();
-            p.stroke(canKill ? 220 : 80, canKill ? 60 : 30, canKill ? 60 : 30, canKill ? 200 : 80);
-            p.strokeWeight(1); p.rect(btn1X, btn1Y, btn1W, btn1H, 3);
-            // Button text
-            p.noStroke();
-            p.fill(canKill ? [255,120,120] : [100,60,60], canKill ? 230 : 100);
-            if (canKill) p.fill(255, 120, 120, 230); else p.fill(100, 60, 60, 100);
-            p.textSize(9); p.textAlign(p.CENTER, p.CENTER);
-            p.text('☠ Kill Ghost (' + KILL_GHOST_COST + '◆)', btn1X + btn1W/2, btn1Y + btn1H/2);
+            // Mazes won / lost
+            p.fill(80, 200, 120, 200);
+            p.text('won: ' + mazesWon[i] + '   lost: ' + mazesLost[i], sx, panelY + 57);
 
-            // ── Mutate Maze button (10 gems) ──
-            let btn2X = panelX + panelW - 92;
-            let btn2Y = panelY + 25;
-            let btn2W = 82, btn2H = 17;
-            let canMutate = c.gemsCollected >= MUTATE_MAZE_COST;
+            // Death pip indicators
             p.noStroke();
-            if (canMutate) p.fill(20, 100, 160, 220); else p.fill(15, 35, 55, 120);
-            p.rect(btn2X, btn2Y, btn2W, btn2H, 3);
-            p.noFill();
-            p.stroke(canMutate ? 60 : 30, canMutate ? 160 : 60, canMutate ? 220 : 80, canMutate ? 200 : 80);
-            p.strokeWeight(1); p.rect(btn2X, btn2Y, btn2W, btn2H, 3);
-            p.noStroke();
-            if (canMutate) p.fill(80, 200, 255, 230); else p.fill(40, 80, 110, 100);
-            p.textSize(9); p.textAlign(p.CENTER, p.CENTER);
-            p.text('⚡ Mutate (' + MUTATE_MAZE_COST + '◆)', btn2X + btn2W/2, btn2Y + btn2H/2);
+            for (let d = 0; d < DEATH_LIMIT; d++) {
+                if (d < c.deathCount) p.fill(220, 60, 60, 240);
+                else p.fill(40, 40, 60, 180);
+                p.ellipse(sx + d * 14, panelY + 73, 10, 10);
+            }
+
+            // ── 3 buttons side-by-side, top-right of panel ──
+            // Each button is (panelW/3 - gap) wide, 38px tall, fits in HUD_H
+            let bGap  = 4;
+            let bW    = Math.floor((panelW - 150 - bGap*2) / 3);
+            let bH    = 38;
+            let bY    = panelY + 8;
+            let b1X   = panelX + panelW - (bW*3 + bGap*2) - 8;
+            let b2X   = b1X + bW + bGap;
+            let b3X   = b2X + bW + bGap;
+
+            // Helper to draw one compact button
+            function drawBtn(bx, by, bw, bh, icon, label, cost, active, r, g, b_) {
+                p.noStroke();
+                if (active) p.fill(r, g, b_, 230); else p.fill(r*0.18, g*0.18, b_*0.18, 160);
+                p.rect(bx, by, bw, bh, 4);
+                if (active) {
+                    p.noFill(); p.stroke(r, g, b_, 200); p.strokeWeight(1.5);
+                    p.rect(bx, by, bw, bh, 4);
+                }
+                p.noStroke();
+                if (active) p.fill(255, 255, 255, 240); else p.fill(120, 120, 120, 150);
+                p.textSize(13); p.textAlign(p.CENTER, p.CENTER);
+                p.text(icon, bx + bw*0.5, by + bh*0.33);
+                p.textSize(8);
+                p.text(label, bx + bw*0.5, by + bh*0.67);
+                p.textSize(7);
+                if (active) p.fill(255, 230, 100, 200); else p.fill(100, 100, 80, 130);
+                p.text('(' + cost + '◆)', bx + bw*0.5, by + bh*0.88);
+            }
+
+            let canKill  = c.gemsCollected >= KILL_GHOST_COST && ghosts.some(g=>g.mz===c.mz);
+            let canAlly  = c.gemsCollected >= ALLY_COST;
+            let canMutate= c.gemsCollected >= MUTATE_MAZE_COST;
+
+            drawBtn(b1X, bY, bW, bH, '☠', 'Kill Ghost',   KILL_GHOST_COST,  canKill,   220, 50,  50);
+            drawBtn(b2X, bY, bW, bH, '👻','Ally',          ALLY_COST,         canAlly,   200, 170, 0);
+            drawBtn(b3X, bY, bW, bH, '⚡', 'Mutate',       MUTATE_MAZE_COST,  canMutate, 40,  140, 220);
+
+            c._btn1 = {x:b1X, y:bY, w:bW, h:bH};
+            c._btn2 = {x:b3X, y:bY, w:bW, h:bH};   // mutate
+            c._btn3 = {x:b2X, y:bY, w:bW, h:bH};   // ally
         }
-
-        // Maze generation — top centre
-        p.noStroke(); p.fill(60, 120, 80, 140);
-        p.textSize(10); p.textAlign(p.CENTER, p.TOP);
-        p.text('MAZE #' + (mazeGeneration + 1), p.width/2, 14);
 
         p.pop();
     }
@@ -1841,20 +2342,324 @@ new p5(function(p) {
     }
 
     // ============================================================
-    //  FINISH OVERLAY
+    //  FINISH OVERLAY — each creature slides its own half-heart
+    //  in from its side toward the centre divider
     // ============================================================
+
+    // Draw just the LEFT half of a heart (left lobe + bottom-left)
+    // Heart centred at (cx, cy), half-width sz
+    function drawLeftHalfHeart(ctx, cx, cy, sz) {
+        let w = sz, h = sz * 1.1;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy + h * 0.48);           // tip (centre bottom)
+        ctx.bezierCurveTo(
+            cx - w * 0.08, cy + h * 0.12,
+            cx - w * 0.95, cy - h * 0.08,
+            cx - w * 0.48, cy - h * 0.48
+        );
+        ctx.bezierCurveTo(
+            cx - w * 0.02, cy - h * 0.88,
+            cx,            cy - h * 0.44,
+            cx,            cy - h * 0.22
+        );
+        ctx.lineTo(cx, cy + h * 0.48);           // back down to tip
+        ctx.closePath();
+    }
+
+    // Draw just the RIGHT half of a heart
+    function drawRightHalfHeart(ctx, cx, cy, sz) {
+        let w = sz, h = sz * 1.1;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy + h * 0.48);           // tip (centre bottom)
+        ctx.lineTo(cx, cy - h * 0.22);           // up to centre join
+        ctx.bezierCurveTo(
+            cx,            cy - h * 0.44,
+            cx + w * 0.02, cy - h * 0.88,
+            cx + w * 0.48, cy - h * 0.48
+        );
+        ctx.bezierCurveTo(
+            cx + w * 0.95, cy - h * 0.08,
+            cx + w * 0.08, cy + h * 0.12,
+            cx,            cy + h * 0.48
+        );
+        ctx.closePath();
+    }
+
     function drawFinishOverlay() {
-        if (resetTimer<=0) return;
-        let fade=p.map(resetTimer,RESET_DELAY,0,0,210);
+        let ctx = p.drawingContext;
+        // Heart target: vertically centred, horizontally at the divider
+        let hcx = p.width / 2;
+        let hcy = HUD_H + (p.height - HUD_H) / 2;  // true centre of maze area
+        let bothDone = creatures.every(c => c.finished);
+
+        for (let i = 0; i < creatures.length; i++) {
+            let c = creatures[i];
+            if (!c.finished) continue;
+            let isLeft = (i === 0);
+            let pal    = c.palette;
+            let pulse  = 0.5 + 0.5 * Math.sin(c.finishTimer * 0.06);
+            let sz     = CELL * (1.4 + pulse * 0.2);
+
+            // Slide in from the edge toward centre over ~60 frames
+            let slideT  = Math.min(c.finishTimer / 60, 1);
+            // easeOutBack for a satisfying snap
+            let ease    = 1 + 2.7 * Math.pow(slideT - 1, 3) + 1.7 * Math.pow(slideT - 1, 2);
+            ease        = Math.max(0, Math.min(1.08, ease));
+
+            // Left half starts far left, right half starts far right
+            let startX  = isLeft ? hcx - p.width * 0.45 : hcx + p.width * 0.45;
+            let heartX  = startX + (hcx - startX) * ease;
+            let heartY  = hcy;
+
+            // Glow behind the half
+            p.push();
+            p.noStroke();
+            p.fill(pal.glow[0], pal.glow[1], pal.glow[2], 22 + 16 * pulse);
+            p.ellipse(heartX + (isLeft ? -sz*0.3 : sz*0.3), heartY, sz*2.5, sz*2.5);
+            p.pop();
+
+            // Draw the half-heart using native canvas
+            ctx.save();
+            if (isLeft) drawLeftHalfHeart(ctx, heartX, heartY, sz);
+            else        drawRightHalfHeart(ctx, heartX, heartY, sz);
+
+            // Fill with creature colour gradient
+            let grad = ctx.createRadialGradient(
+                heartX + (isLeft ? -sz*0.2 : sz*0.2), heartY - sz*0.2, 0,
+                heartX, heartY, sz * 1.1
+            );
+            grad.addColorStop(0, `rgba(${pal.glow[0]},${pal.glow[1]},${pal.glow[2]},1)`);
+            grad.addColorStop(1, `rgba(${pal.glow[0]*0.3|0},${pal.glow[1]*0.3|0},${pal.glow[2]*0.3|0},0.65)`);
+            ctx.fillStyle = grad;
+            ctx.fill();
+
+            // Specular highlight
+            ctx.save();
+            if (isLeft) drawLeftHalfHeart(ctx, heartX - sz*0.08, heartY - sz*0.12, sz*0.5);
+            else        drawRightHalfHeart(ctx, heartX + sz*0.08, heartY - sz*0.12, sz*0.5);
+            ctx.fillStyle = `rgba(255,255,255,${0.22 + 0.14*pulse})`;
+            ctx.fill();
+            ctx.restore();
+            ctx.restore();
+
+            // Sparkles — more intense when both done
+            if (p.frameCount % (bothDone ? 4 : 9) < 2) {
+                spawnPop(
+                    heartX + p.random(-sz*0.6, isLeft ? 0 : sz*0.6),
+                    heartY + p.random(-sz*0.7, sz*0.5),
+                    pal.glow[0], pal.glow[1], pal.glow[2], bothDone ? 3 : 1
+                );
+            }
+        }
+
+        // Both finished — dim overlay + NEW MAZE label below
+        if (resetTimer <= 0) return;
+        let fade = p.map(resetTimer, RESET_DELAY, 0, 0, 160);
+        let tf   = 0.5 + 0.5 * Math.sin(p.frameCount * 0.15);
         p.push();
-        p.noStroke(); p.fill(6,6,12,fade*0.55);
-        p.rect(0,0,p.width,p.height);
-        let tf=0.5+0.5*Math.sin(p.frameCount*0.15);
-        p.textAlign(p.CENTER,p.CENTER);
-        p.textSize(CELL*0.88); p.fill(30,255,120,200*tf);
-        p.text('NEW MAZE',p.width/2,p.height/2);
-        p.textSize(CELL*0.33); p.fill(30,200,80,140*tf);
-        p.text('both familiars arrived',p.width/2,p.height/2+CELL*1.05);
+        p.noStroke(); p.fill(6, 6, 12, fade * 0.38);
+        p.rect(0, 0, p.width, p.height);
+        p.textAlign(p.CENTER, p.CENTER);
+        p.textSize(CELL * 0.38); p.fill(30, 200, 80, 180 * tf);
+        p.text('NEW MAZE', p.width/2, HUD_H + (p.height-HUD_H)/2 + CELL * 2.8);
+        p.pop();
+    }
+
+    // ============================================================
+    //  AUTOMATIC WALL SHIFTS  — walls move every 30 seconds
+    //  Toggling a random interior wall forces creatures to repath
+    // ============================================================
+    function shiftMazes() {
+        for (let mz of [mazeL, mazeR]) {
+            if (!mz) continue;
+            mz.shiftTimer--;
+            if (mz.shiftTimer > 0) continue;
+            mz.shiftTimer = MAZE_SHIFT_INTERVAL;
+
+            // Pick a random interior cell (not on the border)
+            let attempts = 0;
+            while (attempts++ < 30) {
+                let c = p.floor(p.random(1, mz.cols - 1));
+                let r = p.floor(p.random(1, mz.rows - 1));
+                // Pick a random direction that leads to a valid neighbour
+                let dirs = p.shuffle(['N','S','E','W']);
+                for (let d of dirs) {
+                    let nc=c, nr=r;
+                    if (d==='N') nr--; if (d==='S') nr++;
+                    if (d==='E') nc++; if (d==='W') nc--;
+                    if (nr<0||nr>=mz.rows||nc<0||nc>=mz.cols) continue;
+                    let opp = opposite(d);
+
+                    // Toggle this wall — if it's a wall, open it; if open, close it
+                    // But never isolate a cell (keep at least one open exit)
+                    let cell    = mz.cells[r][c];
+                    let neigh   = mz.cells[nr][nc];
+                    let wasWall = cell.walls[d];
+
+                    if (!wasWall) {
+                        // Closing a passage — only if both cells have other exits
+                        let cellExits  = ['N','S','E','W'].filter(x=>x!==d  &&!cell.walls[x]).length;
+                        let neighExits = ['N','S','E','W'].filter(x=>x!==opp&&!neigh.walls[x]).length;
+                        if (cellExits < 1 || neighExits < 1) continue; // would isolate
+                        cell.walls[d]    = true;
+                        neigh.walls[opp] = true;
+                    } else {
+                        // Opening a new passage
+                        cell.walls[d]    = false;
+                        neigh.walls[opp] = false;
+                    }
+
+                    // Flash the shifted wall location
+                    mz.shiftFlash = { c, r, d, timer: 45, opened: wasWall };
+
+                    // Force any creature in this maze to repath from current pos
+                    for (let creature of creatures) {
+                        if (creature.mz !== mz || creature.finished) continue;
+                        let curC = p.constrain(p.floor((creature.x - mz.offsetX)/CELL), 0, mz.cols-1);
+                        let curR = p.constrain(p.floor((creature.y - (mz.offsetY||0))/CELL), 0, mz.rows-1);
+                        let goal = creature.paths[0][creature.paths[0].length-1];
+                        let newP = findMultiplePaths(mz, curC, curR, goal.col, goal.row, PATHS_PER_MAZE);
+                        if (newP && newP.length > 0 && newP[0].length > 1) {
+                            creature.paths      = newP;
+                            creature.pathSetIdx = 0;
+                            creature.pathIndex  = 1;
+                            creature.trail      = [];
+                        }
+                    }
+                    break;
+                }
+                if (mz.shiftFlash) break;
+            }
+        }
+    }
+
+    // Draw the wall-shift flash indicator in drawMaze
+    function drawShiftFlash(mz) {
+        if (!mz.shiftFlash) return;
+        let sf = mz.shiftFlash;
+        sf.timer--;
+        if (sf.timer <= 0) { mz.shiftFlash = null; return; }
+        let oy  = mz.offsetY || 0;
+        let ox  = mz.offsetX;
+        let frac = sf.timer / 45;
+        let x1  = sf.c * CELL + ox, y1 = sf.r * CELL + oy;
+        let x2  = x1 + CELL,        y2 = y1 + CELL;
+        // Highlight the two cells involved
+        p.push();
+        p.noStroke();
+        p.fill(sf.opened ? 80 : 255, sf.opened ? 200 : 80, 80, 60 * frac);
+        p.rect(x1, y1, CELL, CELL);
+        // Draw a bright line on the toggled wall edge
+        p.stroke(sf.opened ? 60 : 255, sf.opened ? 255 : 60, 60, 200 * frac);
+        p.strokeWeight(3);
+        if (sf.d==='E'||sf.d==='W') {
+            let wx = (sf.d==='E') ? x2 : x1;
+            p.line(wx, y1, wx, y2);
+        } else {
+            let wy = (sf.d==='S') ? y2 : y1;
+            p.line(x1, wy, x2, wy);
+        }
+        p.pop();
+    }
+
+    // ============================================================
+    //  PERSISTENT STATS  (localStorage)
+    // ============================================================
+    function saveStats() {
+        try {
+            let data = {
+                totalDeaths, mazesWon, mazesLost,
+                gemCounts, mazeGeneration,
+                savedAt: new Date().toISOString(),
+            };
+            localStorage.setItem('familiar_stats', JSON.stringify(data));
+        } catch(e) {}
+    }
+
+    function loadStats() {
+        try {
+            let raw = localStorage.getItem('familiar_stats');
+            if (!raw) return;
+            let d = JSON.parse(raw);
+            if (d.totalDeaths)  totalDeaths  = d.totalDeaths;
+            if (d.mazesWon)     mazesWon     = d.mazesWon;
+            if (d.mazesLost)    mazesLost    = d.mazesLost;
+            if (d.gemCounts)    gemCounts    = d.gemCounts;
+            if (d.mazeGeneration !== undefined) mazeGeneration = d.mazeGeneration;
+        } catch(e) {}
+    }
+
+    // Past scores popup — cache data at open time, never read localStorage in draw loop
+    let showPopup   = false;
+    let popupData   = null;   // cached stats, loaded once when popup opens
+    let statsBtn    = null;   // {x,y,w,h} set each frame
+
+    function drawStatsButton() {
+        // Small button right at the centre divider, vertically centred
+        let bw = 110, bh = 26;
+        let bx = p.width/2 - bw/2;
+        let by = HUD_H + (p.height - HUD_H)/2 - bh/2;  // true centre of maze area
+        statsBtn = {x:bx, y:by, w:bw, h:bh};
+        let hover = p.mouseX>bx && p.mouseX<bx+bw && p.mouseY>by && p.mouseY<by+bh;
+        p.push();
+        p.noStroke();
+        p.fill(10, 16, 30, 200);
+        p.rect(bx, by, bw, bh, 6);
+        p.noFill();
+        p.stroke(showPopup ? 60:40, showPopup ? 220:160, showPopup ? 100:80, hover?255:180);
+        p.strokeWeight(hover ? 2 : 1.5);
+        p.rect(bx, by, bw, bh, 6);
+        p.noStroke();
+        p.fill(showPopup ? 80:60, showPopup ? 220:180, showPopup ? 120:100, hover?255:200);
+        p.textFont('monospace'); p.textSize(10);
+        p.textAlign(p.CENTER, p.CENTER);
+        p.text('📊 PAST SCORES', bx+bw/2, by+bh/2);
+        p.pop();
+    }
+
+    // Load popup data once — called only when toggling open, not every frame
+    function openPopup() {
+        try {
+            let raw = localStorage.getItem('familiar_stats');
+            popupData = raw ? JSON.parse(raw) : null;
+        } catch(e) { popupData = null; }
+        showPopup = true;
+    }
+
+    function drawPastRunsPopup() {
+        if (!showPopup || !popupData) return;
+        // All drawing uses cached popupData — no localStorage reads here
+        let d  = popupData;
+        let px = p.width/2 - 160, py = 60, pw = 320, ph = 165;
+        let alpha = 220;
+
+        p.push();
+        p.noStroke(); p.fill(0, 0, 0, alpha * 0.5);
+        p.rect(px+4, py+4, pw, ph, 10);
+        p.fill(10, 14, 26, alpha);
+        p.rect(px, py, pw, ph, 10);
+        p.noFill(); p.stroke(60, 180, 100, alpha); p.strokeWeight(1.5);
+        p.rect(px, py, pw, ph, 10);
+
+        p.noStroke(); p.textFont('monospace');
+        p.fill(60, 220, 100, alpha);
+        p.textSize(13); p.textAlign(p.CENTER, p.TOP);
+        p.text('LAST SESSION', p.width/2, py + 12);
+
+        let sx = px + 20, sy = py + 36;
+        p.textSize(11); p.textAlign(p.LEFT, p.TOP);
+        p.fill(80, 200, 255, alpha);
+        p.text('GREEN  ◆ gems: ' + (d.gemCounts?.[0]||0), sx, sy);
+        p.text('       won: '+(d.mazesWon?.[0]||0)+'  lost: '+(d.mazesLost?.[0]||0)+'  deaths: '+(d.totalDeaths?.[0]||0), sx, sy+16);
+        p.fill(200, 80, 220, alpha);
+        p.text('PURPLE ◆ gems: ' + (d.gemCounts?.[1]||0), sx, sy+36);
+        p.text('       won: '+(d.mazesWon?.[1]||0)+'  lost: '+(d.mazesLost?.[1]||0)+'  deaths: '+(d.totalDeaths?.[1]||0), sx, sy+52);
+
+        p.fill(120, 120, 160, alpha * 0.8);
+        p.textSize(9); p.textAlign(p.CENTER, p.BOTTOM);
+        let ts = d.savedAt ? new Date(d.savedAt).toLocaleString() : '';
+        p.text('saved: ' + ts, p.width/2, py + ph - 16);
+        p.text('click anywhere to dismiss', p.width/2, py + ph - 4);
         p.pop();
     }
 
