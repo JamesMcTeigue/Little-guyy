@@ -34,7 +34,7 @@ new p5(function(p) {
     const ALLY_COST          = 10;   // ← gems to summon a ghost-killing ally
     const CREATURE_SPEED    = 0.13; // ← multiplier of CELL for creature speed
     const EYE_RADIUS        = 0.38;  // ← eye size multiplier of BLOB_DIST (bigger = larger eyes)
-    const NARROW_CHANCE     = 0.018;  // ← fraction of passages that are narrow (0=none, 1=all)
+    const NARROW_CHANCE     = 0.18;  // ← fraction of passages that are narrow (0=none, 1=all)
 
     // ── Timing (frames at 60fps) ──
     const REROUTE_FRAMES        = 180;  // frames blocked before rerouting
@@ -62,7 +62,7 @@ new p5(function(p) {
     let mazesLost     = [0, 0];
 
     const PALETTES = [
-        { body:[6,10,16],   glow:[10,220,90],  shimmer:[60,140,255], trail:[8,28,14],  trailGlow:[15,200,80]  },
+        { body:[4,12,20],   glow:[0,210,255],  shimmer:[0,140,220],  trail:[4,18,28],  trailGlow:[0,190,240]  },
         { body:[16,4,20],   glow:[210,40,220], shimmer:[255,70,200], trail:[28,8,24],  trailGlow:[200,40,200] },
     ];
 
@@ -818,6 +818,42 @@ new p5(function(p) {
     // Pick a valid direction for the ghost to move from (col,row)
     // Prefers moving toward the nearest creature in the same maze
     // Avoids reversing (lastDir = opposite) unless it's the only option
+    // BFS for ghosts — respects ghost walls (narrow passages) and closed doors
+    // Returns the first direction to take from (col,row) toward (tc,tr)
+    function ghostBFS(mz, col, row, tc, tr) {
+        if (col===tc && row===tr) return null;
+        let queue   = [{c:col, r:row, path:[]}];
+        let visited = new Set([`${col},${row}`]);
+        while (queue.length > 0) {
+            let {c, r, path} = queue.shift();
+            let cell = mz.cells[r][c];
+            for (let d of ['N','S','E','W']) {
+                let nc=c, nr=r;
+                if (d==='N') nr--; if (d==='S') nr++;
+                if (d==='E') nc++; if (d==='W') nc--;
+                if (nr<0||nr>=mz.rows||nc<0||nc>=mz.cols) continue;
+                let key=`${nc},${nr}`;
+                if (visited.has(key)) continue;
+                // Ghost can't pass narrow passages or closed doors
+                if (cell.walls[d] || cell['ghostWall_'+d]) continue;
+                // Ghost can't pass through closed doors (same check as doorBlocksStep)
+                let blocked=false;
+                for (let door of doors) {
+                    if (door.open) continue;
+                    let opp=opposite(d);
+                    if (door.col===c&&door.row===r&&door.dir===d)   { blocked=true; break; }
+                    if (door.col===nc&&door.row===nr&&door.dir===opp){ blocked=true; break; }
+                }
+                if (blocked) continue;
+                visited.add(key);
+                let newPath = path.length===0 ? [d] : path;
+                if (nc===tc && nr===tr) return path.length===0 ? d : path[0];
+                queue.push({c:nc, r:nr, path: path.length===0 ? [d] : path});
+            }
+        }
+        return null; // no path found
+    }
+
     function pickGhostDir(mz, col, row, lastDir, targetCreature, ghost) {
         let cell = mz.cells[row][col];
         let dirs = ['N','S','E','W'];
@@ -859,21 +895,36 @@ new p5(function(p) {
     function updateGhosts() {
         for (let g of ghosts) {
             g.phase += 0.06;
-            if (g.spawnDelay > 0) { g.spawnDelay--; continue; }  // not active yet
+            if (g.spawnDelay > 0) { g.spawnDelay--; continue; }
 
-            // Find the creature in this maze
-            let target = creatures.find(c => c.mz === g.mz);
+            let target = creatures.find(c => c.mz === g.mz && !c.finished);
 
             if (!g.moving) {
-                // Pick next cell to walk into
-                let d = pickGhostDir(g.mz, g.col, g.row, g.dir, target, g);
-                if (!d) continue;
+                let d = null;
+
+                // Use BFS to find real path to creature
+                if (target) {
+                    let tc = p.constrain(p.floor((target.x - g.mz.offsetX)/CELL), 0, g.mz.cols-1);
+                    let tr = p.constrain(p.floor((target.y - (g.mz.offsetY||0))/CELL), 0, g.mz.rows-1);
+                    d = ghostBFS(g.mz, g.col, g.row, tc, tr);
+                }
+                // Fallback: random open direction if BFS fails or no target
+                if (!d) {
+                    let cell = g.mz.cells[g.row][g.col];
+                    let open = ['N','S','E','W'].filter(dir =>
+                        !cell.walls[dir] && !cell['ghostWall_'+dir]
+                    );
+                    let noRev = open.filter(dir => dir !== opposite(g.dir));
+                    let cands = noRev.length > 0 ? noRev : open;
+                    if (cands.length === 0) continue;
+                    d = cands[p.floor(p.random(cands.length))];
+                }
+
                 g.dir = d;
                 g.moving = true;
                 let nc=g.col, nr=g.row;
                 if (d==='N') nr--; if (d==='S') nr++;
                 if (d==='E') nc++; if (d==='W') nc--;
-                // Clamp to maze bounds
                 nc = p.constrain(nc, 0, g.mz.cols-1);
                 nr = p.constrain(nr, 0, g.mz.rows-1);
                 g.targetCol = nc; g.targetRow = nr;
