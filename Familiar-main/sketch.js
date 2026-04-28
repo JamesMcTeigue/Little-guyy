@@ -30,7 +30,8 @@ new p5(function(p) {
     const DEATH_LIMIT       = 5;    // ← deaths before maze regenerates
     const KILL_GHOST_COST   = 5;    // ← gems to kill nearest ghost
     const MUTATE_MAZE_COST  = 5;    // ← gems to mutate maze section
-    const BONUS_GEMS        = 10;   // ← gem bonus when both reach end
+    const BONUS_GEMS             = 10;   // ← gem bonus when both reach end
+    const WINS_FOR_CELEBRATION   = 3;    // ← joint wins before big heart celebration
     const ALLY_COST          = 10;   // ← gems to summon a ghost-killing ally
     const CREATURE_SPEED    = 0.13; // ← multiplier of CELL for creature speed
     const EYE_RADIUS        = 0.38;  // ← eye size multiplier of BLOB_DIST (bigger = larger eyes)
@@ -54,6 +55,10 @@ new p5(function(p) {
 
     // ── Persistent state (never reset between mazes) ──
     let resetTimer    = -1;
+    let jointWins     = 0;   // joint maze completions this session
+    let celebrating   = false; // big heart celebration active
+    let celebrateT    = 0;   // celebration animation timer
+    let celebrateBtn  = null; // play-again button rect
     let deathCounts   = [0, 0];
     let gemCounts     = [0, 0];
     let mazeGeneration = 0;
@@ -348,6 +353,13 @@ new p5(function(p) {
 
     p.mousePressed = function() {
         let mx=p.mouseX, my=p.mouseY;
+        // Play-again button during celebration
+        if (celebrating && celebrateBtn &&
+            mx>celebrateBtn.x&&mx<celebrateBtn.x+celebrateBtn.w&&
+            my>celebrateBtn.y&&my<celebrateBtn.y+celebrateBtn.h) {
+            resetGame(); return;
+        }
+        if (celebrating) return; // block other clicks during celebration
         // Toggle stats popup via button — load data fresh only on open
         if (statsBtn && mx>statsBtn.x && mx<statsBtn.x+statsBtn.w && my>statsBtn.y && my<statsBtn.y+statsBtn.h) {
             if (!showPopup) openPopup(); else showPopup = false;
@@ -1538,12 +1550,14 @@ new p5(function(p) {
         updateParticles();
         drawParticles();
         drawFinishOverlay();
+        drawCelebration();
         drawHUD();
         drawStatsButton();
         drawPastRunsPopup();
         drawMapChangeWarning();
         tickReset();
         tickMapChange();
+        tickCelebration();
         } catch(e) {
             p.background(0);
             p.fill(255,80,80); p.noStroke();
@@ -1695,22 +1709,37 @@ new p5(function(p) {
     }
 
     function checkAllFinished() {
-        if (creatures.every(c=>c.finished)) {
+        if (!creatures.every(c=>c.finished)) return;
+        jointWins++;
+        // Bonus gems
+        for (let c of creatures) { c.gemsCollected += BONUS_GEMS; c.gemFlash = 40; }
+        gemCounts[0] = creatures[0].gemsCollected;
+        gemCounts[1] = creatures[1].gemsCollected;
+        saveStats();
+        if (jointWins >= WINS_FOR_CELEBRATION) {
+            // Big celebration — don't auto-reset, show full-screen heart
+            celebrating = true;
+            celebrateT  = 0;
+        } else {
             resetTimer = RESET_DELAY;
-            // 10 gem bonus for completing together!
-            for (let c of creatures) {
-                c.gemsCollected += BONUS_GEMS;
-                c.gemFlash = 40;
-            }
-            gemCounts[0] = creatures[0].gemsCollected;
-            gemCounts[1] = creatures[1].gemsCollected;
-            saveStats();
         }
     }
     function tickReset() {
         if (resetTimer<0) return;
         resetTimer--;
         if (resetTimer===0){resetTimer=-1;init();}
+    }
+
+    function tickCelebration() {
+        if (!celebrating) return;
+        celebrateT++;
+    }
+
+    function resetGame() {
+        jointWins   = 0;
+        celebrating = false;
+        celebrateT  = 0;
+        init();
     }
 
     // ============================================================
@@ -2230,6 +2259,134 @@ new p5(function(p) {
     }
 
     // ============================================================
+    //  CELEBRATION — full-screen heart after WINS_FOR_CELEBRATION joint wins
+    // ============================================================
+    function drawCelebration() {
+        if (!celebrating) return;
+        let ctx = p.drawingContext;
+        let t   = celebrateT;
+
+        // Phase 1 (0-60): dark overlay fades in
+        // Phase 2 (60-180): heart expands from centre outward
+        // Phase 3 (180+): full screen, show play-again button
+
+        // Dark overlay
+        let overlayAlpha = p.constrain(p.map(t, 0, 60, 0, 230), 0, 230);
+        p.noStroke(); p.fill(4, 4, 10, overlayAlpha);
+        p.rect(0, 0, p.width, p.height);
+
+        // Expanding heart — grows from tiny to covering the screen
+        let heartPhase = p.constrain(t - 40, 0, 999);
+        // Use easeOutExpo for dramatic expansion
+        let eased = heartPhase < 140
+            ? 1 - Math.pow(2, -10 * heartPhase / 140)
+            : 1;
+        let maxSz  = p.width * 0.72;
+        let sz     = maxSz * eased;
+        let pulse  = t > 180 ? 0.5 + 0.5 * Math.sin(t * 0.07) : 0;
+        sz        += pulse * CELL * 1.2;
+
+        let hcx = p.width / 2;
+        let hcy = p.height / 2 - CELL * 0.5;
+
+        if (sz > 4) {
+            ctx.save();
+            // Full heart (both halves) — blend both creature colours
+            let pal0 = creatures[0] ? creatures[0].palette : PALETTES[0];
+            let pal1 = creatures[1] ? creatures[1].palette : PALETTES[1];
+
+            // Draw right half (creature 1 colour)
+            drawRightHalfHeart(ctx, hcx, hcy, sz);
+            let gr1 = ctx.createRadialGradient(hcx+sz*0.25, hcy-sz*0.2, 0, hcx, hcy, sz*1.1);
+            gr1.addColorStop(0, `rgba(${pal1.glow[0]},${pal1.glow[1]},${pal1.glow[2]},0.95)`);
+            gr1.addColorStop(1, `rgba(${pal1.glow[0]*0.3|0},${pal1.glow[1]*0.3|0},${pal1.glow[2]*0.3|0},0.6)`);
+            ctx.fillStyle = gr1; ctx.fill();
+
+            // Draw left half (creature 0 colour)
+            drawLeftHalfHeart(ctx, hcx, hcy, sz);
+            let gr0 = ctx.createRadialGradient(hcx-sz*0.25, hcy-sz*0.2, 0, hcx, hcy, sz*1.1);
+            gr0.addColorStop(0, `rgba(${pal0.glow[0]},${pal0.glow[1]},${pal0.glow[2]},0.95)`);
+            gr0.addColorStop(1, `rgba(${pal0.glow[0]*0.3|0},${pal0.glow[1]*0.3|0},${pal0.glow[2]*0.3|0},0.6)`);
+            ctx.fillStyle = gr0; ctx.fill();
+
+            // Specular sheen
+            drawLeftHalfHeart(ctx, hcx - sz*0.1, hcy - sz*0.12, sz*0.45);
+            ctx.fillStyle = `rgba(255,255,255,${0.15 + 0.1*pulse})`;
+            ctx.fill();
+            drawRightHalfHeart(ctx, hcx + sz*0.1, hcy - sz*0.12, sz*0.45);
+            ctx.fill();
+            ctx.restore();
+        }
+
+        // Particle burst — ongoing sparkles
+        if (t > 60 && t % 3 < 2) {
+            let angle = p.random(p.TWO_PI);
+            let dist  = p.random(sz * 0.3, sz * 0.8);
+            let pal   = p.random() > 0.5
+                ? (creatures[0]||{palette:PALETTES[0]}).palette
+                : (creatures[1]||{palette:PALETTES[1]}).palette;
+            spawnPop(
+                hcx + Math.cos(angle)*dist,
+                hcy + Math.sin(angle)*dist*0.8,
+                pal.glow[0], pal.glow[1], pal.glow[2], 3
+            );
+        }
+
+        // Text + play-again button (after heart fills screen)
+        if (t > 160) {
+            let textFade = p.constrain(p.map(t, 160, 220, 0, 1), 0, 1);
+
+            // "YOU DID IT" title
+            p.push();
+            p.noStroke();
+            p.textAlign(p.CENTER, p.CENTER);
+            p.textFont('monospace');
+            p.textSize(CELL * 1.1);
+            p.fill(255, 255, 255, 220 * textFade);
+            p.text('YOU DID IT', hcx, hcy - CELL * 1.2);
+
+            p.textSize(CELL * 0.38);
+            p.fill(220, 220, 255, 180 * textFade);
+            p.text(jointWins + ' mazes cleared together!', hcx, hcy - CELL * 0.3);
+
+            // Stats summary
+            let gems0 = creatures[0] ? creatures[0].gemsCollected : gemCounts[0];
+            let gems1 = creatures[1] ? creatures[1].gemsCollected : gemCounts[1];
+            p.textSize(CELL * 0.28);
+            p.fill(180, 240, 255, 160 * textFade);
+            p.text('◆ ' + gems0 + '  wins:' + mazesWon[0], hcx - CELL*3.5, hcy + CELL * 0.6);
+            p.fill(255, 180, 255, 160 * textFade);
+            p.text('◆ ' + gems1 + '  wins:' + mazesWon[1], hcx + CELL*1.5, hcy + CELL * 0.6);
+            p.pop();
+
+            // Play-again button
+            let bw = 200, bh = 50;
+            let bx = hcx - bw/2, by = hcy + CELL * 1.5;
+            celebrateBtn = {x:bx, y:by, w:bw, h:bh};
+            let hover = p.mouseX>bx&&p.mouseX<bx+bw&&p.mouseY>by&&p.mouseY<by+bh;
+            let btnAlpha = textFade * (hover ? 1 : 0.85);
+
+            p.push();
+            p.noStroke();
+            p.fill(255, 255, 255, 40 * btnAlpha);
+            p.rect(bx, by, bw, bh, 10);
+            p.noFill();
+            p.stroke(255, 255, 255, 180 * btnAlpha);
+            p.strokeWeight(hover ? 2.5 : 1.5);
+            p.rect(bx, by, bw, bh, 10);
+            p.noStroke();
+            p.fill(255, 255, 255, 230 * btnAlpha);
+            p.textAlign(p.CENTER, p.CENTER);
+            p.textFont('monospace');
+            p.textSize(CELL * 0.48);
+            p.text('▶  PLAY AGAIN', hcx, by + bh/2);
+            p.pop();
+        } else {
+            celebrateBtn = null;
+        }
+    }
+
+    // ============================================================
     //  HUD  — separate panels per side, full stats, big buttons
     // ============================================================
     function drawHUD() {
@@ -2319,7 +2476,8 @@ new p5(function(p) {
             // Each button is (panelW/3 - gap) wide, 38px tall, fits in HUD_H
             let bGap  = 4;
             let bW    = Math.floor((panelW - 150 - bGap*2) / 3);
-            let bH    = 38;
+            let panelH2 = HUD_H - 16;
+            let bH    = panelH2 - 16;  // buttons fill most of the panel height
             let bY    = panelY + 8;
             let b1X   = panelX + panelW - (bW*3 + bGap*2) - 8;
             let b2X   = b1X + bW + bGap;
@@ -2646,6 +2804,7 @@ new p5(function(p) {
     let statsBtn    = null;   // {x,y,w,h} set each frame
 
     function drawStatsButton() {
+        if (celebrating) { statsBtn = null; return; }  // hidden during celebration
         // Small button right at the centre divider, vertically centred
         let bw = 110, bh = 26;
         let bx = p.width/2 - bw/2;
@@ -2678,6 +2837,7 @@ new p5(function(p) {
     }
 
     function drawPastRunsPopup() {
+        if (celebrating) { showPopup = false; return; }  // close during celebration
         if (!showPopup || !popupData) return;
         // All drawing uses cached popupData — no localStorage reads here
         let d  = popupData;
